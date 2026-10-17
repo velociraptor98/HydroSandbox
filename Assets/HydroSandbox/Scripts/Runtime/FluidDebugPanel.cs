@@ -41,7 +41,7 @@ namespace HydroSandbox
             string solverMs = solver.HasGpuSolveTiming ? $"{solver.GpuSolveMilliseconds:F2} ms" : "n/a";
             string frameGpuMs = gpuFrameMs > 0 ? $"{gpuFrameMs:F2} ms" : "n/a";
             GUILayout.Label($"GPU frame {frameGpuMs}   solver {solverMs}");
-            GUILayout.Label($"Particles {solver.ParticleCount:N0}");
+            GUILayout.Label($"Particles {solver.AliveCount:N0} / {solver.Capacity:N0}");
 
             GUILayout.BeginHorizontal();
             foreach (int count in CountPresets)

@@ -21,12 +21,37 @@ float _InvRestDensity;
 float _Poly6Coeff;
 float _SpikyGradCoeff;
 float _ConstraintRelaxation;
+float _Cohesion;
 float _SCorrK;
 float _SCorrInvWdq;
 float _Viscosity;
+float _AerationImpactMin;
+float _AerationImpactRange;
+float _AerationDecay;
+float _AerationBuoyancy;
+float _AerationDiffusion;
 
 float3 _ContainerMin;
 float3 _ContainerMax;
+
+// _ParticleCount is the pool capacity. _FluidState[0] is the live count: after every sort the
+// live particles occupy [0, count) and the dead are packed behind them. Liveness itself is
+// position.w (1 alive, 0 dead), which every kernel writing a position must preserve.
+StructuredBuffer<uint> _FluidState;
+
+#define DEAD_CELL 0xffffffffu
+
+bool IsAlive(float4 p)
+{
+    return p.w > 0.5;
+}
+
+// 0 for particles in air (stream, spray: well under rest density), 1 once inside the body of
+// water. Bubbles only float, and air is only entrained, where the water is submerged.
+float Submersion(float density)
+{
+    return saturate((density * _InvRestDensity - 0.75) * 5.0);
+}
 
 float Poly6(float r2)
 {

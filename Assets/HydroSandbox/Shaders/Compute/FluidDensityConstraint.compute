@@ -16,7 +16,7 @@ RWStructuredBuffer<float4> _DeltaPosition;
 void ComputeLambda(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidState[0])
         return;
 
     float3 pi = _Predicted[i].xyz;
@@ -37,9 +37,11 @@ void ComputeLambda(uint3 id : SV_DispatchThreadID)
     END_FOR_EACH_NEIGHBOR
 
     float density = _ParticleMass * densitySum;
-    // Unilateral: under-dense particles (free surface, spray) are left alone instead of
-    // being pulled together, which otherwise clumps them.
-    float c = max(density * _InvRestDensity - 1.0, 0.0);
+    // Compression is always corrected. Under-density only partly (cohesion): a full pull clumps
+    // surface particles, none at all lets a falling stream tear into separate droplets.
+    float c = density * _InvRestDensity - 1.0;
+    if (c < 0.0)
+        c *= _Cohesion;
 
     _Density[i] = density;
     _Lambda[i] = -c / (sumGradSq + dot(gradI, gradI) + _ConstraintRelaxation);
@@ -49,7 +51,7 @@ void ComputeLambda(uint3 id : SV_DispatchThreadID)
 void ComputeDeltaPosition(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidState[0])
         return;
 
     float3 pi = _Predicted[i].xyz;
@@ -75,8 +77,9 @@ void ComputeDeltaPosition(uint3 id : SV_DispatchThreadID)
 void ApplyDeltaPosition(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidState[0])
         return;
 
-    _Predicted[i] = float4(_Predicted[i].xyz + _DeltaPosition[i].xyz, 0);
+    float4 p = _Predicted[i];
+    _Predicted[i] = float4(p.xyz + _DeltaPosition[i].xyz, p.w);
 }

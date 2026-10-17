@@ -18,6 +18,21 @@ namespace HydroSandbox
 
         public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
 
+        [Tooltip("How strongly under-dense particles are pulled back toward rest density (0 = only compression is resisted). Keeps streams and sheets together.")]
+        [Range(0f, 1f)] public float cohesion = 0f;
+
+        [Header("Aeration (foam)")]
+        [Tooltip("Velocity change in one substep, in m/s, above which water traps air.")]
+        [Min(0f)] public float aerationImpactMin = 1.0f;
+        [Tooltip("Range of velocity change over which aeration ramps from 0 to 1.")]
+        [Min(0.01f)] public float aerationImpactRange = 1.0f;
+        [Tooltip("Decay rate of aeration, per second.")]
+        [Min(0f)] public float aerationDecay = 0.35f;
+        [Tooltip("How fast aeration spreads to neighboring water, per substep (XSPH-style blend).")]
+        [Range(0f, 1f)] public float aerationDiffusion = 0.25f;
+        [Tooltip("Fraction of gravity cancelled at full aeration (bubble buoyancy). Above 1 makes aerated water rise.")]
+        [Range(0f, 3f)] public float aerationBuoyancy = 1.6f;
+
         [Header("Advanced")]
         [Tooltip("Simulated seconds per rendered frame. Fixed, so stability does not depend on frame rate.")]
         [Range(0.004f, 0.034f)] public float timeStep = 1f / 60f;

@@ -1,19 +1,26 @@
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Profiling;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 
 namespace HydroSandbox
 {
     /// <summary>
-    /// GPU Position-Based Fluids solver. Owns the particle buffers and records every solver stage
-    /// into one command buffer per frame.
+    /// GPU Position-Based Fluids solver. Owns a fixed-capacity particle pool and records every
+    /// solver stage, plus all active <see cref="FluidSource"/>s and <see cref="FluidSink"/>s, into one
+    /// command buffer per frame.
     /// </summary>
     public class FluidSolver : MonoBehaviour
     {
         const int ThreadGroupSize = 256;
         const int ScanBlockSize = 1024;
         const int MaxNeighbors = 64;
+        const int MaxSinks = 32;
+        const int MaxSpawnLayers = 256;
+        const int MaxSpawnPoints = 16384;
+        const int AliveReadbackInterval = 10;
         const float ReferenceDensity = 1000f;
 
         [Header("Compute Shaders")]
@@ -23,10 +30,16 @@ namespace HydroSandbox
         [SerializeField] ComputeShader densityConstraintShader;
         [SerializeField] ComputeShader collisionShader;
         [SerializeField] ComputeShader velocityShader;
+        [SerializeField] ComputeShader emissionShader;
 
         [Header("Simulation")]
         [SerializeField] FluidSolverSettings settings = new FluidSolverSettings();
-        [SerializeField, Min(1)] int particleCount = 100000;
+        [FormerlySerializedAs("particleCount")]
+        [Tooltip("Pool size. Sources stop emitting while the pool is full.")]
+        [SerializeField, Min(1)] int capacity = 100000;
+
+        [Tooltip("Particles placed in the spawn region at reset; the rest of the pool starts empty.")]
+        [SerializeField, Min(0)] int initialParticles = 100000;
         [SerializeField] bool paused;
 
         [Header("Scene")]
@@ -45,11 +58,19 @@ namespace HydroSandbox
         GraphicsBuffer particleCell, sortedCellId;
         GraphicsBuffer cellCount, cellStart;
         GraphicsBuffer neighborList, neighborCount;
+        GraphicsBuffer fluidState;
+        GraphicsBuffer sinkRecords, sinkCounters, spawnLayers, spawnPattern;
         readonly List<GraphicsBuffer> scanBlockSums = new List<GraphicsBuffer>();
         readonly List<GraphicsBuffer> scanBlockOffsets = new List<GraphicsBuffer>();
 
-        int activeCount;
+        int poolSize;
         int hashTableSize;
+        int bufferGeneration;
+        int frameIndex;
+        readonly List<SinkRecord> sinkList = new List<SinkRecord>();
+        readonly uint[] zeroCounters = new uint[MaxSinks];
+        readonly List<SpawnLayer> layerList = new List<SpawnLayer>();
+        readonly List<Vector2> patternList = new List<Vector2>();
         int gridBitsX, gridBitsY, gridBitsZ;
 
         CommandBuffer cmd;
@@ -58,7 +79,9 @@ namespace HydroSandbox
 
         int predictKernel;
         int clearCountsKernel, hashKernel, scanKernel, addOffsetsKernel, reorderKernel;
+        int aliveCountKernel;
         int neighborListKernel;
+        int sinkKernel, spawnKernel;
         int lambdaKernel, deltaKernel, applyDeltaKernel;
         int containerKernel;
         int updateVelocityKernel, viscosityKernel;
@@ -67,9 +90,14 @@ namespace HydroSandbox
 
         public FluidSolverSettings Settings => settings;
         public bool IsReady => positions != null;
-        public int ParticleCount => activeCount;
+        public int Capacity => poolSize;
+
+        /// <summary>Live particle count, read back asynchronously every few frames (display only).</summary>
+        public int AliveCount { get; private set; }
+
         public float ParticleRadius => settings.particleRadius;
         public GraphicsBuffer PositionBuffer => positions;
+        /// <summary>xyz = velocity, w = aeration (0..1).</summary>
         public GraphicsBuffer VelocityBuffer => velocities;
         public float GpuSolveMilliseconds { get; private set; }
         public bool HasGpuSolveTiming => SystemInfo.supportsGpuRecorder;
@@ -86,9 +114,11 @@ namespace HydroSandbox
             set => container = value;
         }
 
+        /// <summary>Resizes the pool and fills it completely at reset.</summary>
         public void SetParticleCount(int count)
         {
-            particleCount = Mathf.Max(1, count);
+            capacity = Mathf.Max(1, count);
+            initialParticles = capacity;
             ResetSimulation();
         }
 
@@ -111,7 +141,8 @@ namespace HydroSandbox
                 return;
             }
             if (predictShader == null || neighborSearchShader == null || neighborListShader == null ||
-                densityConstraintShader == null || collisionShader == null || velocityShader == null)
+                densityConstraintShader == null || collisionShader == null || velocityShader == null ||
+                emissionShader == null)
             {
                 Debug.LogError("FluidSolver is missing compute shader references.", this);
                 enabled = false;
@@ -148,10 +179,24 @@ namespace HydroSandbox
             cmd.Clear();
             cmd.BeginSample(solveSampler);
             PushParameters(settings.timeStep / substeps);
+            RecordEmission(settings.timeStep);
             for (int i = 0; i < substeps; i++)
                 RecordSubstep();
             cmd.EndSample(solveSampler);
             Graphics.ExecuteCommandBuffer(cmd);
+
+            if (++frameIndex % AliveReadbackInterval == 0)
+                RequestAliveCount();
+        }
+
+        void RequestAliveCount()
+        {
+            int generation = bufferGeneration;
+            AsyncGPUReadback.Request(fluidState, request =>
+            {
+                if (!request.hasError && generation == bufferGeneration)
+                    AliveCount = (int)request.GetData<uint>()[0];
+            });
         }
 
         void FindKernels()
@@ -162,6 +207,7 @@ namespace HydroSandbox
             scanKernel = neighborSearchShader.FindKernel("ScanBlocks");
             addOffsetsKernel = neighborSearchShader.FindKernel("AddBlockOffsets");
             reorderKernel = neighborSearchShader.FindKernel("ReorderParticles");
+            aliveCountKernel = neighborSearchShader.FindKernel("UpdateAliveCount");
             neighborListKernel = neighborListShader.FindKernel("BuildNeighborList");
             lambdaKernel = densityConstraintShader.FindKernel("ComputeLambda");
             deltaKernel = densityConstraintShader.FindKernel("ComputeDeltaPosition");
@@ -169,38 +215,47 @@ namespace HydroSandbox
             containerKernel = collisionShader.FindKernel("ResolveContainer");
             updateVelocityKernel = velocityShader.FindKernel("UpdateVelocity");
             viscosityKernel = velocityShader.FindKernel("ApplyViscosity");
+            sinkKernel = emissionShader.FindKernel("ApplySinks");
+            spawnKernel = emissionShader.FindKernel("SpawnParticles");
         }
 
         void AllocateBuffers()
         {
-            activeCount = particleCount;
+            poolSize = capacity;
+            bufferGeneration++;
             // About two cells per particle keeps the wrap period larger than typical scenes.
             // Bits are split x >= z >= y because container scenes are usually shallowest in y.
-            hashTableSize = Mathf.NextPowerOfTwo(Mathf.Max(activeCount * 2, 1 << 15));
+            hashTableSize = Mathf.NextPowerOfTwo(Mathf.Max(poolSize * 2, 1 << 15));
             int totalBits = Mathf.RoundToInt(Mathf.Log(hashTableSize, 2));
             gridBitsX = (totalBits + 2) / 3;
             gridBitsZ = (totalBits - gridBitsX + 1) / 2;
             gridBitsY = totalBits - gridBitsX - gridBitsZ;
 
-            positions = CreateBuffer(activeCount, 16);
-            positionsAlt = CreateBuffer(activeCount, 16);
-            predicted = CreateBuffer(activeCount, 16);
-            predictedAlt = CreateBuffer(activeCount, 16);
-            velocities = CreateBuffer(activeCount, 16);
-            velocitiesAlt = CreateBuffer(activeCount, 16);
-            fluidType = CreateBuffer(activeCount, 4);
-            fluidTypeAlt = CreateBuffer(activeCount, 4);
-            density = CreateBuffer(activeCount, 4);
-            lambda = CreateBuffer(activeCount, 4);
-            deltaPosition = CreateBuffer(activeCount, 16);
-            particleCell = CreateBuffer(activeCount, 8);
-            sortedCellId = CreateBuffer(activeCount, 4);
-            cellCount = CreateBuffer(hashTableSize, 4);
-            cellStart = CreateBuffer(hashTableSize, 4);
-            neighborList = CreateBuffer(activeCount * MaxNeighbors, 4);
-            neighborCount = CreateBuffer(activeCount, 4);
+            positions = CreateBuffer(poolSize, 16);
+            positionsAlt = CreateBuffer(poolSize, 16);
+            predicted = CreateBuffer(poolSize, 16);
+            predictedAlt = CreateBuffer(poolSize, 16);
+            velocities = CreateBuffer(poolSize, 16);
+            velocitiesAlt = CreateBuffer(poolSize, 16);
+            fluidType = CreateBuffer(poolSize, 4);
+            fluidTypeAlt = CreateBuffer(poolSize, 4);
+            density = CreateBuffer(poolSize, 4);
+            lambda = CreateBuffer(poolSize, 4);
+            deltaPosition = CreateBuffer(poolSize, 16);
+            particleCell = CreateBuffer(poolSize, 8);
+            sortedCellId = CreateBuffer(poolSize, 4);
+            // One extra bucket past the table collects dead particles.
+            cellCount = CreateBuffer(hashTableSize + 1, 4);
+            cellStart = CreateBuffer(hashTableSize + 1, 4);
+            neighborList = CreateBuffer(poolSize * MaxNeighbors, 4);
+            neighborCount = CreateBuffer(poolSize, 4);
+            fluidState = CreateBuffer(4, 4);
+            sinkRecords = CreateBuffer(MaxSinks, Marshal.SizeOf<SinkRecord>());
+            sinkCounters = CreateBuffer(MaxSinks, 4);
+            spawnLayers = CreateBuffer(MaxSpawnLayers, Marshal.SizeOf<SpawnLayer>());
+            spawnPattern = CreateBuffer(MaxSpawnPoints, 8);
 
-            int levelCount = hashTableSize;
+            int levelCount = hashTableSize + 1;
             do
             {
                 int blocks = (levelCount + ScanBlockSize - 1) / ScanBlockSize;
@@ -219,12 +274,14 @@ namespace HydroSandbox
                      {
                          positions, positionsAlt, predicted, predictedAlt, velocities, velocitiesAlt,
                          fluidType, fluidTypeAlt, density, lambda, deltaPosition,
-                         particleCell, sortedCellId, cellCount, cellStart, neighborList, neighborCount
+                         particleCell, sortedCellId, cellCount, cellStart, neighborList, neighborCount,
+                         fluidState, sinkRecords, sinkCounters, spawnLayers, spawnPattern
                      })
                 buffer?.Release();
             positions = positionsAlt = predicted = predictedAlt = velocities = velocitiesAlt = null;
             fluidType = fluidTypeAlt = density = lambda = deltaPosition = null;
             particleCell = sortedCellId = cellCount = cellStart = neighborList = neighborCount = null;
+            fluidState = sinkRecords = sinkCounters = spawnLayers = spawnPattern = null;
 
             foreach (var buffer in scanBlockSums)
                 buffer.Release();
@@ -232,7 +289,8 @@ namespace HydroSandbox
                 buffer.Release();
             scanBlockSums.Clear();
             scanBlockOffsets.Clear();
-            activeCount = 0;
+            poolSize = 0;
+            AliveCount = 0;
         }
 
         void UploadInitialState()
@@ -246,29 +304,33 @@ namespace HydroSandbox
 
             int nx = Mathf.Max(1, Mathf.FloorToInt(regionSize.x / spacing) + 1);
             int nz = Mathf.Max(1, Mathf.FloorToInt(regionSize.z / spacing) + 1);
-            int layers = (activeCount + nx * nz - 1) / (nx * nz);
+            int initial = Mathf.Min(initialParticles, poolSize);
+            int layers = (initial + nx * nz - 1) / (nx * nz);
             if (regionMin.y + (layers - 1) * spacing > innerMax.y)
-                Debug.LogWarning($"FluidSolver: {activeCount} particles stack above the container; enlarge the container or spawn region.", this);
+                Debug.LogWarning($"FluidSolver: {initial} particles stack above the container; enlarge the container or spawn region.", this);
 
             // Tiny jitter breaks the perfect lattice symmetry that otherwise makes the column
             // collapse in unnaturally straight sheets.
             var random = new System.Random(1234);
-            var data = new Vector4[activeCount];
-            for (int i = 0; i < activeCount; i++)
+            var data = new Vector4[poolSize];
+            for (int i = 0; i < initial; i++)
             {
                 int x = i % nx;
                 int z = (i / nx) % nz;
                 int y = i / (nx * nz);
                 Vector3 jitter = new Vector3((float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f,
                     (float)random.NextDouble() - 0.5f) * (0.02f * spacing);
-                data[i] = regionMin + new Vector3(x, y, z) * spacing + jitter;
+                Vector3 p = regionMin + new Vector3(x, y, z) * spacing + jitter;
+                data[i] = new Vector4(p.x, p.y, p.z, 1f);
             }
             positions.SetData(data);
             predicted.SetData(data);
 
             System.Array.Clear(data, 0, data.Length);
             velocities.SetData(data);
-            fluidType.SetData(new uint[activeCount]);
+            fluidType.SetData(new uint[poolSize]);
+            fluidState.SetData(new uint[] { (uint)initial, 0, 0, 0 });
+            AliveCount = initial;
         }
 
         // Mass is chosen so a cubic lattice at 2r spacing evaluates to ReferenceDensity, which
@@ -307,9 +369,9 @@ namespace HydroSandbox
             float wDeltaQ = poly6 * Mathf.Pow(h2 - deltaQ2, 3);
             Vector3 inset = Vector3.one * r;
 
-            foreach (var cs in new[] { predictShader, neighborSearchShader, neighborListShader, densityConstraintShader, collisionShader, velocityShader })
+            foreach (var cs in new[] { predictShader, neighborSearchShader, neighborListShader, densityConstraintShader, collisionShader, velocityShader, emissionShader })
             {
-                cmd.SetComputeIntParam(cs, Ids.ParticleCount, activeCount);
+                cmd.SetComputeIntParam(cs, Ids.ParticleCount, poolSize);
                 cmd.SetComputeFloatParam(cs, Ids.DeltaTime, dt);
                 cmd.SetComputeVectorParam(cs, Ids.Gravity, settings.gravity);
                 cmd.SetComputeFloatParam(cs, Ids.MaxSpeed, settings.maxSpeed);
@@ -325,11 +387,75 @@ namespace HydroSandbox
                 cmd.SetComputeFloatParam(cs, Ids.Poly6Coeff, poly6);
                 cmd.SetComputeFloatParam(cs, Ids.SpikyGradCoeff, -45f / (Mathf.PI * Mathf.Pow(h, 6)));
                 cmd.SetComputeFloatParam(cs, Ids.ConstraintRelaxation, settings.constraintRelaxation / h2);
+                cmd.SetComputeFloatParam(cs, Ids.Cohesion, settings.cohesion);
                 cmd.SetComputeFloatParam(cs, Ids.SCorrK, settings.artificialPressure * h2);
                 cmd.SetComputeFloatParam(cs, Ids.SCorrInvWdq, 1f / wDeltaQ);
                 cmd.SetComputeFloatParam(cs, Ids.Viscosity, settings.viscosity);
+                cmd.SetComputeFloatParam(cs, Ids.AerationImpactMin, settings.aerationImpactMin);
+                cmd.SetComputeFloatParam(cs, Ids.AerationImpactRange, settings.aerationImpactRange);
+                cmd.SetComputeFloatParam(cs, Ids.AerationDecay, settings.aerationDecay);
+                cmd.SetComputeFloatParam(cs, Ids.AerationBuoyancy, settings.aerationBuoyancy);
+                cmd.SetComputeFloatParam(cs, Ids.AerationDiffusion, settings.aerationDiffusion);
                 cmd.SetComputeVectorParam(cs, Ids.ContainerMin, container.min + inset);
                 cmd.SetComputeVectorParam(cs, Ids.ContainerMax, container.max - inset);
+            }
+        }
+
+        void RecordEmission(float dt)
+        {
+            float spacing = settings.ParticleSpacing;
+            var es = emissionShader;
+
+            sinkList.Clear();
+            foreach (var sink in FluidSink.Active)
+            {
+                if (sinkList.Count < MaxSinks)
+                    sinkList.Add(sink.BuildRecord(dt, spacing));
+            }
+            if (sinkList.Count > 0)
+            {
+                cmd.SetBufferData(sinkRecords, sinkList);
+                cmd.SetBufferData(sinkCounters, zeroCounters);
+                cmd.SetComputeIntParam(es, Ids.SinkCount, sinkList.Count);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.Sinks, sinkRecords);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.SinkCounters, sinkCounters);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.FluidState, fluidState);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.Positions, positions);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(es, sinkKernel, Ids.Velocities, velocities);
+                DispatchParticles(es, sinkKernel);
+            }
+
+            layerList.Clear();
+            patternList.Clear();
+            int pointCount = 0;
+            foreach (var source in FluidSource.Active)
+            {
+                if (layerList.Count < MaxSpawnLayers)
+                    source.Emit(dt, spacing, layerList, patternList, ref pointCount, MaxSpawnPoints);
+            }
+            if (layerList.Count > MaxSpawnLayers)
+            {
+                layerList.RemoveRange(MaxSpawnLayers, layerList.Count - MaxSpawnLayers);
+                SpawnLayer last = layerList[MaxSpawnLayers - 1];
+                pointCount = (int)(last.firstPoint + last.patternCount);
+            }
+            if (pointCount > 0)
+            {
+                cmd.SetBufferData(spawnLayers, layerList);
+                cmd.SetBufferData(spawnPattern, patternList);
+                cmd.SetComputeIntParam(es, Ids.SpawnLayerCount, layerList.Count);
+                cmd.SetComputeIntParam(es, Ids.SpawnPointCount, pointCount);
+                cmd.SetComputeFloatParam(es, Ids.SpawnJitter, 0.02f * spacing);
+                cmd.SetComputeIntParam(es, Ids.FrameSeed, frameIndex * 104729);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.SpawnLayers, spawnLayers);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.SpawnPattern, spawnPattern);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.FluidState, fluidState);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.Positions, positions);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.Velocities, velocities);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.FluidType, fluidType);
+                cmd.DispatchCompute(es, spawnKernel, Groups(pointCount, ThreadGroupSize), 1, 1);
             }
         }
 
@@ -339,6 +465,7 @@ namespace HydroSandbox
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Positions, positions);
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Velocities, velocities);
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Predicted, predicted);
+            cmd.SetComputeBufferParam(ps, predictKernel, Ids.Density, density);
             DispatchParticles(ps, predictKernel);
 
             // Also before the neighbor search: the neighbor list is fixed for the substep, so
@@ -353,17 +480,20 @@ namespace HydroSandbox
             for (int i = 0; i < Mathf.Max(1, settings.solverIterations); i++)
             {
                 BindNeighborList(dc, lambdaKernel);
+                cmd.SetComputeBufferParam(dc, lambdaKernel, Ids.FluidState, fluidState);
                 cmd.SetComputeBufferParam(dc, lambdaKernel, Ids.Predicted, predicted);
                 cmd.SetComputeBufferParam(dc, lambdaKernel, Ids.Density, density);
                 cmd.SetComputeBufferParam(dc, lambdaKernel, Ids.Lambda, lambda);
                 DispatchParticles(dc, lambdaKernel);
 
                 BindNeighborList(dc, deltaKernel);
+                cmd.SetComputeBufferParam(dc, deltaKernel, Ids.FluidState, fluidState);
                 cmd.SetComputeBufferParam(dc, deltaKernel, Ids.Predicted, predicted);
                 cmd.SetComputeBufferParam(dc, deltaKernel, Ids.Lambda, lambda);
                 cmd.SetComputeBufferParam(dc, deltaKernel, Ids.DeltaPosition, deltaPosition);
                 DispatchParticles(dc, deltaKernel);
 
+                cmd.SetComputeBufferParam(dc, applyDeltaKernel, Ids.FluidState, fluidState);
                 cmd.SetComputeBufferParam(dc, applyDeltaKernel, Ids.Predicted, predicted);
                 cmd.SetComputeBufferParam(dc, applyDeltaKernel, Ids.DeltaPosition, deltaPosition);
                 DispatchParticles(dc, applyDeltaKernel);
@@ -373,12 +503,15 @@ namespace HydroSandbox
             }
 
             var vs = velocityShader;
+            cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.FluidState, fluidState);
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Positions, positions);
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Velocities, velocities);
+            cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Density, density);
             DispatchParticles(vs, updateVelocityKernel);
 
             BindNeighborList(vs, viscosityKernel);
+            cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.FluidState, fluidState);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.Velocities, velocities);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.VelocitiesOut, velocitiesAlt);
@@ -391,14 +524,18 @@ namespace HydroSandbox
             var ns = neighborSearchShader;
 
             cmd.SetComputeBufferParam(ns, clearCountsKernel, Ids.CellCount, cellCount);
-            cmd.DispatchCompute(ns, clearCountsKernel, Groups(hashTableSize, ThreadGroupSize), 1, 1);
+            cmd.DispatchCompute(ns, clearCountsKernel, Groups(hashTableSize + 1, ThreadGroupSize), 1, 1);
 
             cmd.SetComputeBufferParam(ns, hashKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(ns, hashKernel, Ids.CellCount, cellCount);
             cmd.SetComputeBufferParam(ns, hashKernel, Ids.ParticleCell, particleCell);
             DispatchParticles(ns, hashKernel);
 
-            RecordScan(cellCount, cellStart, hashTableSize, 0);
+            RecordScan(cellCount, cellStart, hashTableSize + 1, 0);
+
+            cmd.SetComputeBufferParam(ns, aliveCountKernel, Ids.CellStart, cellStart);
+            cmd.SetComputeBufferParam(ns, aliveCountKernel, Ids.FluidStateOut, fluidState);
+            cmd.DispatchCompute(ns, aliveCountKernel, 1, 1, 1);
 
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.CellStart, cellStart);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.ParticleCell, particleCell);
@@ -422,6 +559,7 @@ namespace HydroSandbox
         void RecordNeighborList()
         {
             var nl = neighborListShader;
+            cmd.SetComputeBufferParam(nl, neighborListKernel, Ids.FluidState, fluidState);
             cmd.SetComputeBufferParam(nl, neighborListKernel, Ids.CellStart, cellStart);
             cmd.SetComputeBufferParam(nl, neighborListKernel, Ids.CellCount, cellCount);
             cmd.SetComputeBufferParam(nl, neighborListKernel, Ids.SortedCellId, sortedCellId);
@@ -460,7 +598,7 @@ namespace HydroSandbox
         }
 
         void DispatchParticles(ComputeShader cs, int kernel) =>
-            cmd.DispatchCompute(cs, kernel, Groups(activeCount, ThreadGroupSize), 1, 1);
+            cmd.DispatchCompute(cs, kernel, Groups(poolSize, ThreadGroupSize), 1, 1);
 
         static int Groups(int count, int groupSize) => (count + groupSize - 1) / groupSize;
 
@@ -490,9 +628,15 @@ namespace HydroSandbox
             public static readonly int Poly6Coeff = Shader.PropertyToID("_Poly6Coeff");
             public static readonly int SpikyGradCoeff = Shader.PropertyToID("_SpikyGradCoeff");
             public static readonly int ConstraintRelaxation = Shader.PropertyToID("_ConstraintRelaxation");
+            public static readonly int Cohesion = Shader.PropertyToID("_Cohesion");
             public static readonly int SCorrK = Shader.PropertyToID("_SCorrK");
             public static readonly int SCorrInvWdq = Shader.PropertyToID("_SCorrInvWdq");
             public static readonly int Viscosity = Shader.PropertyToID("_Viscosity");
+            public static readonly int AerationImpactMin = Shader.PropertyToID("_AerationImpactMin");
+            public static readonly int AerationImpactRange = Shader.PropertyToID("_AerationImpactRange");
+            public static readonly int AerationDecay = Shader.PropertyToID("_AerationDecay");
+            public static readonly int AerationBuoyancy = Shader.PropertyToID("_AerationBuoyancy");
+            public static readonly int AerationDiffusion = Shader.PropertyToID("_AerationDiffusion");
             public static readonly int ContainerMin = Shader.PropertyToID("_ContainerMin");
             public static readonly int ContainerMax = Shader.PropertyToID("_ContainerMax");
 
@@ -516,6 +660,18 @@ namespace HydroSandbox
             public static readonly int NeighborCount = Shader.PropertyToID("_NeighborCount");
             public static readonly int NeighborListOut = Shader.PropertyToID("_NeighborListOut");
             public static readonly int NeighborCountOut = Shader.PropertyToID("_NeighborCountOut");
+
+            public static readonly int FluidState = Shader.PropertyToID("_FluidState");
+            public static readonly int FluidStateOut = Shader.PropertyToID("_FluidStateOut");
+            public static readonly int SinkCount = Shader.PropertyToID("_SinkCount");
+            public static readonly int Sinks = Shader.PropertyToID("_Sinks");
+            public static readonly int SinkCounters = Shader.PropertyToID("_SinkCounters");
+            public static readonly int SpawnLayerCount = Shader.PropertyToID("_SpawnLayerCount");
+            public static readonly int SpawnPointCount = Shader.PropertyToID("_SpawnPointCount");
+            public static readonly int SpawnJitter = Shader.PropertyToID("_SpawnJitter");
+            public static readonly int FrameSeed = Shader.PropertyToID("_FrameSeed");
+            public static readonly int SpawnLayers = Shader.PropertyToID("_SpawnLayers");
+            public static readonly int SpawnPattern = Shader.PropertyToID("_SpawnPattern");
 
             public static readonly int ScanCount = Shader.PropertyToID("_ScanCount");
             public static readonly int ScanInput = Shader.PropertyToID("_ScanInput");

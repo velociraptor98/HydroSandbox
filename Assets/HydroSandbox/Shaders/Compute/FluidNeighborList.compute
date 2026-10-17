@@ -13,7 +13,7 @@ RWStructuredBuffer<uint> _NeighborCountOut;
 void BuildNeighborList(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _ParticleCount)
+    if (i >= _FluidState[0])
         return;
 
     float3 pi = _Predicted[i].xyz;

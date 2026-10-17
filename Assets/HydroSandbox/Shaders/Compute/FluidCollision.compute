@@ -4,14 +4,17 @@
 
 RWStructuredBuffer<float4> _Predicted;
 
-// _ContainerMin/_ContainerMax are already inset by the particle radius.
+// _ContainerMin/_ContainerMax are already inset by the particle radius. Runs over the whole pool
+// because it is also dispatched before the sort, when live particles are not yet contiguous.
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void ResolveContainer(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
     if (i >= _ParticleCount)
         return;
+    float4 p = _Predicted[i];
+    if (!IsAlive(p))
+        return;
 
-    float3 p = _Predicted[i].xyz;
-    _Predicted[i] = float4(clamp(p, _ContainerMin, _ContainerMax), 0);
+    _Predicted[i] = float4(clamp(p.xyz, _ContainerMin, _ContainerMax), p.w);
 }

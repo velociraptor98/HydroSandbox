@@ -319,6 +319,7 @@ MonoBehaviour:
   densityConstraintShader: {fileID: 7200000, guid: c482b34fe32694c46b7d4dc9a650b38b, type: 3}
   collisionShader: {fileID: 7200000, guid: b677faaf2e9724af7bbe4ce98988c330, type: 3}
   velocityShader: {fileID: 7200000, guid: 8b37fa732600a4c4f83985847a3ce904, type: 3}
+  emissionShader: {fileID: 7200000, guid: e98cf4e640b6b4e9dbdd2c1f9abd04f9, type: 3}
   settings:
     substeps: 3
     solverIterations: 3
@@ -331,7 +332,8 @@ MonoBehaviour:
     constraintRelaxation: 0.5
     artificialPressure: 0.03
     maxSpeed: 30
-  particleCount: 100000
+  capacity: 100000
+  initialParticles: 100000
   paused: 0
   container:
     m_Center: {x: 0, y: 1.5, z: 0}

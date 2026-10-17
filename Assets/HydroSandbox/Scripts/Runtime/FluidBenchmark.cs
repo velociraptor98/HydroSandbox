@@ -70,7 +70,7 @@ namespace HydroSandbox
             Application.targetFrameRate = -1;
 
             Bounds baseContainer = solver.Container;
-            int baseCount = Mathf.Max(1, solver.ParticleCount);
+            int baseCount = Mathf.Max(1, solver.Capacity);
             Vector3 cameraOffset = viewCamera != null ? viewCamera.position - baseContainer.center : Vector3.zero;
 
             var report = new StringBuilder();

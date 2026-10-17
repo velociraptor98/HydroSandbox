@@ -55,7 +55,7 @@ namespace HydroSandbox
                 receiveShadows = false,
                 layer = gameObject.layer,
             };
-            Graphics.RenderPrimitives(renderParams, MeshTopology.Triangles, 6, solver.ParticleCount);
+            Graphics.RenderPrimitives(renderParams, MeshTopology.Triangles, 6, solver.Capacity);
         }
     }
 }

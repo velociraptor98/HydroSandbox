@@ -1,0 +1,117 @@
+// Sources and sinks. Both run once per frame before the first substep, while the live
+// particles are still contiguous from the previous frame's last sort.
+
+#pragma kernel ApplySinks
+#pragma kernel SpawnParticles
+
+#include "FluidCommon.hlsl"
+
+// Oriented box: local = dot(p - center, axis), inside when every |local| <= 0.5. The axes are
+// pre-divided by the box size on the CPU.
+struct SinkRecord
+{
+    float3 center;
+    uint budget;
+    float3 axisX;
+    float pad0;
+    float3 axisY;
+    float pad1;
+    float3 axisZ;
+    float pad2;
+};
+
+// One cross-section of a source's stream. Thread t spawns pattern point
+// (t - firstPoint) of the layer whose range contains t; layers are sorted by firstPoint.
+struct SpawnLayer
+{
+    float3 origin;
+    uint firstPoint;
+    float3 velocity;
+    uint patternStart;
+    float3 axisU;
+    uint patternCount;
+    float3 axisV;
+    uint fluidType;
+};
+
+uint _SinkCount;
+uint _SpawnLayerCount;
+uint _SpawnPointCount;
+float _SpawnJitter;
+uint _FrameSeed;
+
+StructuredBuffer<SinkRecord> _Sinks;
+RWStructuredBuffer<uint> _SinkCounters;
+StructuredBuffer<SpawnLayer> _SpawnLayers;
+StructuredBuffer<float2> _SpawnPattern;
+
+RWStructuredBuffer<float4> _Positions;
+RWStructuredBuffer<float4> _Predicted;
+RWStructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<uint> _FluidType;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplySinks(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _FluidState[0])
+        return;
+    float4 p = _Positions[i];
+    if (!IsAlive(p))
+        return;
+
+    for (uint s = 0; s < _SinkCount; s++)
+    {
+        SinkRecord sink = _Sinks[s];
+        float3 d = p.xyz - sink.center;
+        float3 local = float3(dot(d, sink.axisX), dot(d, sink.axisY), dot(d, sink.axisZ));
+        if (any(abs(local) > 0.5))
+            continue;
+
+        uint taken;
+        InterlockedAdd(_SinkCounters[s], 1, taken);
+        if (taken >= sink.budget)
+            continue;
+
+        _Positions[i] = float4(p.xyz, 0);
+        _Predicted[i] = float4(p.xyz, 0);
+        _Velocities[i] = 0;
+        return;
+    }
+}
+
+float3 HashJitter(uint seed)
+{
+    uint h1 = WangHash(seed);
+    uint h2 = WangHash(h1);
+    uint h3 = WangHash(h2);
+    return float3(h1 & 0xffffu, h2 & 0xffffu, h3 & 0xffffu) * (2.0 / 65535.0) - 1.0;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SpawnParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint t = id.x;
+    if (t >= _SpawnPointCount)
+        return;
+    uint slot = _FluidState[0] + t;
+    if (slot >= _ParticleCount)
+        return;
+
+    uint layerIndex = 0;
+    for (; layerIndex + 1 < _SpawnLayerCount; layerIndex++)
+    {
+        SpawnLayer candidate = _SpawnLayers[layerIndex];
+        if (t < candidate.firstPoint + candidate.patternCount)
+            break;
+    }
+    SpawnLayer layer = _SpawnLayers[layerIndex];
+    float2 q = _SpawnPattern[layer.patternStart + (t - layer.firstPoint)];
+
+    float3 position = layer.origin + layer.axisU * q.x + layer.axisV * q.y
+        + HashJitter(t * 7919u + _FrameSeed) * _SpawnJitter;
+    _Positions[slot] = float4(position, 1);
+    _Predicted[slot] = float4(position, 1);
+    _Velocities[slot] = float4(layer.velocity, 0);
+    _FluidType[slot] = layer.fluidType;
+}

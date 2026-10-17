@@ -62,13 +62,17 @@ Shader "HydroSandbox/FluidDebugParticle"
             Varyings Vert(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
             {
                 Varyings o;
-                float3 centerVS = TransformWorldToView(_Positions[instanceId].xyz);
+                float4 particle = _Positions[instanceId];
+                float3 centerVS = TransformWorldToView(particle.xyz);
                 float2 corner = kCorners[vertexId];
                 o.positionCS = TransformWViewToHClip(centerVS + float3(corner * _ParticleRadius, 0));
                 o.corner = corner;
                 o.centerVS = centerVS;
                 float speed = length(_Velocities[instanceId].xyz);
                 o.color = lerp(_SlowColor.rgb, _FastColor.rgb, saturate(speed / _FastSpeed));
+                // Dead pool slots (w = 0) collapse to a degenerate quad outside the clip volume.
+                if (particle.w < 0.5)
+                    o.positionCS = float4(2, 2, 2, 1);
                 return o;
             }
 

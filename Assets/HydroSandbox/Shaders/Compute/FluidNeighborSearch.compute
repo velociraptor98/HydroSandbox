@@ -1,11 +1,13 @@
 // Counting sort of particles by hashed cell: count per bucket, exclusive scan for bucket
-// starts, then scatter every particle stream into bucket order.
+// starts, then scatter every particle stream into bucket order. Dead particles go to one extra
+// bucket after the table (key _HashTableSize), which packs them behind the live ones.
 
 #pragma kernel ClearCellCounts
 #pragma kernel HashParticles
 #pragma kernel ScanBlocks
 #pragma kernel AddBlockOffsets
 #pragma kernel ReorderParticles
+#pragma kernel UpdateAliveCount
 
 #include "FluidCommon.hlsl"
 
@@ -29,6 +31,7 @@ RWStructuredBuffer<float4> _PredictedOut;
 RWStructuredBuffer<float4> _VelocitiesOut;
 RWStructuredBuffer<uint> _FluidTypeOut;
 RWStructuredBuffer<uint> _SortedCellId;
+RWStructuredBuffer<uint> _FluidStateOut;
 
 uint _ScanCount;
 StructuredBuffer<uint> _ScanInput;
@@ -41,7 +44,7 @@ groupshared uint gs_Scan[SCAN_BLOCK_SIZE];
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void ClearCellCounts(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x < _HashTableSize)
+    if (id.x <= _HashTableSize)
         _CellCount[id.x] = 0;
 }
 
@@ -52,8 +55,9 @@ void HashParticles(uint3 id : SV_DispatchThreadID)
     if (i >= _ParticleCount)
         return;
 
-    uint cellId = PackCell(CellCoord(_Predicted[i].xyz));
-    uint key = CellKey(cellId);
+    float4 p = _Predicted[i];
+    uint cellId = IsAlive(p) ? PackCell(CellCoord(p.xyz)) : DEAD_CELL;
+    uint key = cellId == DEAD_CELL ? _HashTableSize : CellKey(cellId);
     uint offset;
     InterlockedAdd(_CellCount[key], 1, offset);
     _ParticleCell[i] = uint2(cellId, offset);
@@ -135,10 +139,17 @@ void ReorderParticles(uint3 id : SV_DispatchThreadID)
         return;
 
     uint2 cell = _ParticleCell[i];
-    uint dst = _CellStart[CellKey(cell.x)] + cell.y;
+    uint key = cell.x == DEAD_CELL ? _HashTableSize : CellKey(cell.x);
+    uint dst = _CellStart[key] + cell.y;
     _PositionsOut[dst] = _Positions[i];
     _PredictedOut[dst] = _Predicted[i];
     _VelocitiesOut[dst] = _Velocities[i];
     _FluidTypeOut[dst] = _FluidType[i];
     _SortedCellId[dst] = cell.x;
+}
+
+[numthreads(1, 1, 1)]
+void UpdateAliveCount(uint3 id : SV_DispatchThreadID)
+{
+    _FluidStateOut[0] = _CellStart[_HashTableSize];
 }
