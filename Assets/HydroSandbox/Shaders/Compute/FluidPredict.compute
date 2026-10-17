@@ -1,0 +1,19 @@
+#pragma kernel Predict
+
+#include "FluidCommon.hlsl"
+
+StructuredBuffer<float4> _Positions;
+RWStructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<float4> _Predicted;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void Predict(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 v = _Velocities[i].xyz + _Gravity * _DeltaTime;
+    _Velocities[i] = float4(v, 0);
+    _Predicted[i] = float4(_Positions[i].xyz + v * _DeltaTime, 0);
+}

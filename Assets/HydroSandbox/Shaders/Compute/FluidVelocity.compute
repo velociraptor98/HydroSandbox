@@ -1,0 +1,51 @@
+#pragma kernel UpdateVelocity
+#pragma kernel ApplyViscosity
+
+#include "FluidNeighbors.hlsl"
+
+RWStructuredBuffer<float4> _Positions;
+RWStructuredBuffer<float4> _Predicted;
+RWStructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<float4> _VelocitiesOut;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateVelocity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 predicted = _Predicted[i].xyz;
+    float3 v = (predicted - _Positions[i].xyz) / _DeltaTime;
+    float speed = length(v);
+    if (speed > _MaxSpeed)
+        v *= _MaxSpeed / speed;
+
+    _Velocities[i] = float4(v, 0);
+    _Positions[i] = float4(predicted, 0);
+}
+
+// XSPH: blend each velocity toward its kernel-weighted neighborhood average. Written to a
+// second buffer because neighbors read the unsmoothed velocities.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyViscosity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 pi = _Predicted[i].xyz;
+    float3 vi = _Velocities[i].xyz;
+    float3 sum = 0;
+
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Predicted[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        sum += (_Velocities[j].xyz - vi) * Poly6(r2);
+    END_FOR_EACH_NEIGHBOR
+
+    float3 v = vi + _Viscosity * (_ParticleMass * _InvRestDensity) * sum;
+    _VelocitiesOut[i] = float4(v, 0);
+}

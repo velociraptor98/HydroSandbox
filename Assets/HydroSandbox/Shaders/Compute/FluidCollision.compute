@@ -1,0 +1,17 @@
+#pragma kernel ResolveContainer
+
+#include "FluidCommon.hlsl"
+
+RWStructuredBuffer<float4> _Predicted;
+
+// _ContainerMin/_ContainerMax are already inset by the particle radius.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ResolveContainer(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 p = _Predicted[i].xyz;
+    _Predicted[i] = float4(clamp(p, _ContainerMin, _ContainerMax), 0);
+}

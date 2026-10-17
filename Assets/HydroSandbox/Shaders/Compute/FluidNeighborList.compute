@@ -1,0 +1,33 @@
+// Gathers each particle's neighbors within the smoothing radius once per substep, so the
+// solver passes loop over real neighbors instead of every particle in the 27 cells around.
+
+#pragma kernel BuildNeighborList
+
+#include "FluidGrid.hlsl"
+
+StructuredBuffer<float4> _Predicted;
+RWStructuredBuffer<uint> _NeighborListOut;
+RWStructuredBuffer<uint> _NeighborCountOut;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BuildNeighborList(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 pi = _Predicted[i].xyz;
+    uint count = 0;
+
+    FOR_EACH_GRID_NEIGHBOR(pi, j)
+        if (j == i || count >= MAX_NEIGHBORS)
+            continue;
+        float3 r = pi - _Predicted[j].xyz;
+        if (dot(r, r) >= _SmoothingRadiusSq)
+            continue;
+        _NeighborListOut[count * _ParticleCount + i] = j;
+        count++;
+    END_FOR_EACH_GRID_NEIGHBOR
+
+    _NeighborCountOut[i] = count;
+}

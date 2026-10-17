@@ -1,0 +1,82 @@
+// Position-Based Fluids density constraint (Macklin & Mueller 2013), Jacobi style:
+// lambda and delta-position are computed for all particles before any position moves.
+
+#pragma kernel ComputeLambda
+#pragma kernel ComputeDeltaPosition
+#pragma kernel ApplyDeltaPosition
+
+#include "FluidNeighbors.hlsl"
+
+RWStructuredBuffer<float4> _Predicted;
+RWStructuredBuffer<float> _Density;
+RWStructuredBuffer<float> _Lambda;
+RWStructuredBuffer<float4> _DeltaPosition;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeLambda(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 pi = _Predicted[i].xyz;
+    float massOverRest = _ParticleMass * _InvRestDensity;
+    float densitySum = Poly6(0);
+    float3 gradI = 0;
+    float sumGradSq = 0;
+
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Predicted[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        densitySum += Poly6(r2);
+        float3 grad = massOverRest * SpikyGradient(r, r2, i, j);
+        gradI += grad;
+        sumGradSq += dot(grad, grad);
+    END_FOR_EACH_NEIGHBOR
+
+    float density = _ParticleMass * densitySum;
+    // Unilateral: under-dense particles (free surface, spray) are left alone instead of
+    // being pulled together, which otherwise clumps them.
+    float c = max(density * _InvRestDensity - 1.0, 0.0);
+
+    _Density[i] = density;
+    _Lambda[i] = -c / (sumGradSq + dot(gradI, gradI) + _ConstraintRelaxation);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeDeltaPosition(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    float3 pi = _Predicted[i].xyz;
+    float lambdaI = _Lambda[i];
+    float3 delta = 0;
+
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Predicted[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        // Artificial pressure (s_corr) against tensile-instability clustering, n = 4.
+        float ratio = Poly6(r2) * _SCorrInvWdq;
+        ratio *= ratio;
+        float sCorr = -_SCorrK * ratio * ratio;
+        delta += (lambdaI + _Lambda[j] + sCorr) * SpikyGradient(r, r2, i, j);
+    END_FOR_EACH_NEIGHBOR
+
+    _DeltaPosition[i] = float4(delta * (_ParticleMass * _InvRestDensity), 0);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyDeltaPosition(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    _Predicted[i] = float4(_Predicted[i].xyz + _DeltaPosition[i].xyz, 0);
+}

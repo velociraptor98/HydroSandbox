@@ -1,0 +1,144 @@
+// Counting sort of particles by hashed cell: count per bucket, exclusive scan for bucket
+// starts, then scatter every particle stream into bucket order.
+
+#pragma kernel ClearCellCounts
+#pragma kernel HashParticles
+#pragma kernel ScanBlocks
+#pragma kernel AddBlockOffsets
+#pragma kernel ReorderParticles
+
+#include "FluidCommon.hlsl"
+
+#define SCAN_BLOCK_SIZE 1024
+#define SCAN_THREADS (SCAN_BLOCK_SIZE / 2)
+
+uint _HashTableSize;
+
+RWStructuredBuffer<uint> _CellCount;
+StructuredBuffer<uint> _CellStart;
+// x = packed cell id, y = slot within its bucket. Packed into one buffer because Metal
+// allows at most 8 UAVs per kernel and ReorderParticles already writes five streams.
+RWStructuredBuffer<uint2> _ParticleCell;
+
+StructuredBuffer<float4> _Positions;
+StructuredBuffer<float4> _Predicted;
+StructuredBuffer<float4> _Velocities;
+StructuredBuffer<uint> _FluidType;
+RWStructuredBuffer<float4> _PositionsOut;
+RWStructuredBuffer<float4> _PredictedOut;
+RWStructuredBuffer<float4> _VelocitiesOut;
+RWStructuredBuffer<uint> _FluidTypeOut;
+RWStructuredBuffer<uint> _SortedCellId;
+
+uint _ScanCount;
+StructuredBuffer<uint> _ScanInput;
+RWStructuredBuffer<uint> _ScanOutput;
+RWStructuredBuffer<uint> _ScanBlockSums;
+StructuredBuffer<uint> _ScanBlockOffsets;
+
+groupshared uint gs_Scan[SCAN_BLOCK_SIZE];
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ClearCellCounts(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _HashTableSize)
+        _CellCount[id.x] = 0;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void HashParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    uint cellId = PackCell(CellCoord(_Predicted[i].xyz));
+    uint key = CellKey(cellId);
+    uint offset;
+    InterlockedAdd(_CellCount[key], 1, offset);
+    _ParticleCell[i] = uint2(cellId, offset);
+}
+
+// Blelloch work-efficient exclusive scan of one 1024-element block; block totals go to
+// _ScanBlockSums so the host can scan those and add them back for inputs larger than a block.
+[numthreads(SCAN_THREADS, 1, 1)]
+void ScanBlocks(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint t = threadId.x;
+    uint baseIndex = groupId.x * SCAN_BLOCK_SIZE;
+    uint a0 = baseIndex + t;
+    uint b0 = baseIndex + t + SCAN_THREADS;
+
+    gs_Scan[t] = a0 < _ScanCount ? _ScanInput[a0] : 0;
+    gs_Scan[t + SCAN_THREADS] = b0 < _ScanCount ? _ScanInput[b0] : 0;
+
+    uint offset = 1;
+    [unroll]
+    for (uint d = SCAN_BLOCK_SIZE >> 1; d > 0; d >>= 1)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        if (t < d)
+        {
+            uint ai = offset * (2 * t + 1) - 1;
+            uint bi = offset * (2 * t + 2) - 1;
+            gs_Scan[bi] += gs_Scan[ai];
+        }
+        offset <<= 1;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (t == 0)
+    {
+        _ScanBlockSums[groupId.x] = gs_Scan[SCAN_BLOCK_SIZE - 1];
+        gs_Scan[SCAN_BLOCK_SIZE - 1] = 0;
+    }
+
+    [unroll]
+    for (uint d2 = 1; d2 < SCAN_BLOCK_SIZE; d2 <<= 1)
+    {
+        offset >>= 1;
+        GroupMemoryBarrierWithGroupSync();
+        if (t < d2)
+        {
+            uint ai = offset * (2 * t + 1) - 1;
+            uint bi = offset * (2 * t + 2) - 1;
+            uint left = gs_Scan[ai];
+            gs_Scan[ai] = gs_Scan[bi];
+            gs_Scan[bi] += left;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (a0 < _ScanCount)
+        _ScanOutput[a0] = gs_Scan[t];
+    if (b0 < _ScanCount)
+        _ScanOutput[b0] = gs_Scan[t + SCAN_THREADS];
+}
+
+[numthreads(SCAN_THREADS, 1, 1)]
+void AddBlockOffsets(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadID)
+{
+    uint blockOffset = _ScanBlockOffsets[groupId.x];
+    uint a0 = groupId.x * SCAN_BLOCK_SIZE + threadId.x;
+    uint b0 = a0 + SCAN_THREADS;
+    if (a0 < _ScanCount)
+        _ScanOutput[a0] += blockOffset;
+    if (b0 < _ScanCount)
+        _ScanOutput[b0] += blockOffset;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ReorderParticles(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+
+    uint2 cell = _ParticleCell[i];
+    uint dst = _CellStart[CellKey(cell.x)] + cell.y;
+    _PositionsOut[dst] = _Positions[i];
+    _PredictedOut[dst] = _Predicted[i];
+    _VelocitiesOut[dst] = _Velocities[i];
+    _FluidTypeOut[dst] = _FluidType[i];
+    _SortedCellId[dst] = cell.x;
+}
