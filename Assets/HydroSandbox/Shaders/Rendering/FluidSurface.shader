@@ -22,6 +22,11 @@ Shader "HydroSandbox/FluidSurface"
 
         StructuredBuffer<float4> _Positions;
         StructuredBuffer<float4> _Velocities;
+        // Last substep's neighbor counts. Particles with at most _DropletMaxNeighbors are loose
+        // droplets: they are left out of the surface (where they would be solid glass beads) and
+        // drawn as spray by the whitewater pass instead.
+        StructuredBuffer<uint> _NeighborCount;
+        uint _DropletMaxNeighbors;
         float _ParticleRadius;
         float _DepthRadiusScale;
         float _ThicknessScale;
@@ -84,8 +89,9 @@ Shader "HydroSandbox/FluidSurface"
             o.centerVS = centerVS;
             o.radius = radius;
             o.speed = length(_Velocities[instanceId].xyz);
-            // Dead pool slots (w = 0) collapse to a degenerate quad outside the clip volume.
-            if (particle.w < 0.5)
+            // Dead pool slots (w = 0) and loose droplets collapse to a degenerate quad outside the
+            // clip volume.
+            if (particle.w < 0.5 || _NeighborCount[instanceId] <= _DropletMaxNeighbors)
                 o.positionCS = float4(2, 2, 2, 1);
             return o;
         }
@@ -367,6 +373,9 @@ Shader "HydroSandbox/FluidSurface"
 
             StructuredBuffer<float4> _WhitewaterPositions;
             StructuredBuffer<float4> _WhitewaterVelocities;
+            // 0: whitewater particles. 1: loose fluid droplets from _Positions, drawn as spray.
+            uint _SplatSource;
+            float _DropletRadius;
             TEXTURE2D(_FoamMask);
             float _WhitewaterRadius;
             float _WhitewaterMinPixels;
@@ -389,15 +398,31 @@ Shader "HydroSandbox/FluidSurface"
             SplatVaryings Vert(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
             {
                 SplatVaryings o;
-                float4 particle = _WhitewaterPositions[instanceId];
-                uint type = (uint)_WhitewaterVelocities[instanceId].w;
+                float4 particle;
+                uint type;
+                float radius;
+                bool visible;
+                if (_SplatSource == 0)
+                {
+                    particle = _WhitewaterPositions[instanceId];
+                    type = (uint)_WhitewaterVelocities[instanceId].w;
+                    radius = _WhitewaterRadius;
+                    visible = particle.w > 0.0;
+                }
+                else
+                {
+                    float4 fluid = _Positions[instanceId];
+                    particle = float4(fluid.xyz, 1.0);
+                    type = 0;
+                    radius = _DropletRadius;
+                    visible = fluid.w > 0.5 && _NeighborCount[instanceId] <= _DropletMaxNeighbors;
+                }
                 float3 centerVS = TransformWorldToView(particle.xyz);
                 float eyeDepth = -centerVS.z;
 
                 // Keep splats at least _WhitewaterMinPixels wide and dim them by the area they
                 // grew by, so distant whitewater thins out instead of aliasing to nothing.
                 float pixelsPerMeter = abs(UNITY_MATRIX_P._m11) * 0.5 * _ScaledScreenParams.y / max(eyeDepth, 1e-3);
-                float radius = _WhitewaterRadius;
                 float pixelRadius = radius * pixelsPerMeter;
                 float grow = max(_WhitewaterMinPixels / max(pixelRadius, 1e-4), 1.0);
                 radius *= grow;
@@ -412,7 +437,7 @@ Shader "HydroSandbox/FluidSurface"
                 o.intensity = intensity;
                 o.isFoam = type == TYPE_FOAM ? 1.0 : 0.0;
                 o.positionWS = particle.xyz;
-                if (particle.w <= 0.0 || eyeDepth <= 0.0)
+                if (!visible || eyeDepth <= 0.0)
                     o.positionCS = float4(2, 2, 2, 1);
                 return o;
             }

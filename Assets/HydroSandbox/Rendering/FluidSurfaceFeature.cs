@@ -61,6 +61,7 @@ namespace HydroSandbox.Rendering
             internal Material material;
             internal MaterialPropertyBlock properties;
             internal int instanceCount;
+            internal int dropletCount;
             internal TextureHandle sceneDepth;
             internal TextureHandle sceneColor;
             internal TextureHandle fluidDepth;
@@ -174,8 +175,7 @@ namespace HydroSandbox.Rendering
                 });
             }
 
-            if (surface.Whitewater != null)
-                RecordWhitewater(renderGraph, resources, surface, material, blurred, width, height);
+            RecordWhitewater(renderGraph, resources, surface, material, blurred, width, height);
         }
 
         void RecordWhitewater(RenderGraph renderGraph, UniversalResourceData resources, FluidSurface surface,
@@ -185,7 +185,8 @@ namespace HydroSandbox.Rendering
 
             using (var builder = renderGraph.AddRasterRenderPass<PassData>("Whitewater Splats", out var data, profilingSampler))
             {
-                Fill(data, surface, material, surface.Whitewater.Capacity);
+                Fill(data, surface, material, surface.Whitewater != null ? surface.Whitewater.Capacity : 0);
+                data.dropletCount = surface.Solver.Capacity;
                 data.sceneDepth = resources.cameraDepthTexture;
                 data.fluidDepth = fluidDepth;
                 builder.UseTexture(data.sceneDepth, AccessFlags.Read);
@@ -193,11 +194,19 @@ namespace HydroSandbox.Rendering
                 builder.SetRenderAttachment(whitewater, 0, AccessFlags.Write);
                 builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
                 {
+                    if (d.instanceCount > 0)
+                    {
+                        d.properties.Clear();
+                        d.surface.SetWhitewaterSplatProperties(d.properties, false);
+                        d.properties.SetTexture(SceneDepthId, d.sceneDepth);
+                        d.properties.SetTexture(FluidDepthId, d.fluidDepth);
+                        ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterSplatPass, MeshTopology.Triangles, 6, d.instanceCount, d.properties);
+                    }
                     d.properties.Clear();
-                    d.surface.SetWhitewaterSplatProperties(d.properties);
+                    d.surface.SetWhitewaterSplatProperties(d.properties, true);
                     d.properties.SetTexture(SceneDepthId, d.sceneDepth);
                     d.properties.SetTexture(FluidDepthId, d.fluidDepth);
-                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterSplatPass, MeshTopology.Triangles, 6, d.instanceCount, d.properties);
+                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterSplatPass, MeshTopology.Triangles, 6, d.dropletCount, d.properties);
                 });
             }
 

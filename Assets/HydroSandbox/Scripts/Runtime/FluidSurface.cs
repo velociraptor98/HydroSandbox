@@ -52,6 +52,10 @@ namespace HydroSandbox
         [SerializeField, Range(0f, 1f)] float flowSheen = 0.35f;
 
         [Header("Whitewater")]
+        [Tooltip("Fluid particles with at most this many neighbors are loose droplets, drawn as spray instead of as surface.")]
+        [SerializeField, Range(0, 8)] int dropletMaxNeighbors = 3;
+        [Tooltip("Spray splat radius of a loose droplet, as a multiple of fluid particle radius.")]
+        [SerializeField, Range(0.1f, 2f)] float dropletRadius = 0.7f;
         [Tooltip("Splat radius of one whitewater particle, as a multiple of fluid particle radius.")]
         [SerializeField, Range(0.05f, 2f)] float whitewaterRadius = 0.4f;
         [Tooltip("Splats never shrink below this many pixels; smaller ones are dimmed instead.")]
@@ -104,6 +108,8 @@ namespace HydroSandbox
             properties.SetFloat(Ids.ParticleRadius, solver.ParticleRadius);
             properties.SetFloat(Ids.DepthRadiusScale, depthRadiusScale);
             properties.SetFloat(Ids.ThicknessScale, thicknessScale);
+            properties.SetBuffer(Ids.NeighborCount, solver.NeighborCountBuffer);
+            properties.SetInt(Ids.DropletMaxNeighbors, dropletMaxNeighbors);
         }
 
         public void SetBlurProperties(MaterialPropertyBlock properties)
@@ -130,10 +136,21 @@ namespace HydroSandbox
             properties.SetFloat(Ids.FlowSheen, flowSheen);
         }
 
-        public void SetWhitewaterSplatProperties(MaterialPropertyBlock properties)
+        /// <summary>
+        /// Splat-pass properties. <paramref name="droplets"/> selects the loose fluid droplets
+        /// instead of the whitewater particles; both draws share everything else.
+        /// </summary>
+        public void SetWhitewaterSplatProperties(MaterialPropertyBlock properties, bool droplets)
         {
-            properties.SetBuffer(Ids.WhitewaterPositions, whitewater.PositionBuffer);
-            properties.SetBuffer(Ids.WhitewaterVelocities, whitewater.VelocityBuffer);
+            // Without whitewater the droplet draw still needs the whitewater buffers bound.
+            bool hasWhitewater = Whitewater != null;
+            properties.SetBuffer(Ids.WhitewaterPositions, hasWhitewater ? whitewater.PositionBuffer : solver.PositionBuffer);
+            properties.SetBuffer(Ids.WhitewaterVelocities, hasWhitewater ? whitewater.VelocityBuffer : solver.VelocityBuffer);
+            properties.SetBuffer(Ids.Positions, solver.PositionBuffer);
+            properties.SetBuffer(Ids.NeighborCount, solver.NeighborCountBuffer);
+            properties.SetInt(Ids.DropletMaxNeighbors, dropletMaxNeighbors);
+            properties.SetInt(Ids.SplatSource, droplets ? 1 : 0);
+            properties.SetFloat(Ids.DropletRadius, dropletRadius * solver.ParticleRadius);
             properties.SetFloat(Ids.WhitewaterRadius, whitewaterRadius * solver.ParticleRadius);
             properties.SetFloat(Ids.WhitewaterMinPixels, whitewaterMinPixels);
             properties.SetFloat(Ids.SprayIntensity, sprayIntensity);
@@ -166,6 +183,10 @@ namespace HydroSandbox
             public static readonly int ParticleRadius = Shader.PropertyToID("_ParticleRadius");
             public static readonly int DepthRadiusScale = Shader.PropertyToID("_DepthRadiusScale");
             public static readonly int ThicknessScale = Shader.PropertyToID("_ThicknessScale");
+            public static readonly int NeighborCount = Shader.PropertyToID("_NeighborCount");
+            public static readonly int DropletMaxNeighbors = Shader.PropertyToID("_DropletMaxNeighbors");
+            public static readonly int SplatSource = Shader.PropertyToID("_SplatSource");
+            public static readonly int DropletRadius = Shader.PropertyToID("_DropletRadius");
             public static readonly int BlurWorldRadius = Shader.PropertyToID("_BlurWorldRadius");
             public static readonly int BlurDepthFalloff = Shader.PropertyToID("_BlurDepthFalloff");
             public static readonly int BlurMaxRadius = Shader.PropertyToID("_BlurMaxRadius");

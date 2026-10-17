@@ -450,11 +450,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: HydroSandbox.Runtime::HydroSandbox.FluidWhitewater
   whitewaterShader: {fileID: 7200000, guid: 1950bbe63c17a4fc2906c823b477808f, type: 3}
   capacity: 262144
-  trappedAirRate: 600
-  trappedAirRange: {x: 2, y: 15}
-  waveCrestRate: 300
+  trappedAirRate: 160
+  trappedAirRange: {x: 8, y: 30}
+  waveCrestRate: 250
   waveCrestRange: {x: 0.5, y: 4}
-  energyRange: {x: 0.5, y: 5}
+  energyRange: {x: 1.2, y: 9}
   maxEmitPerParticle: 8
   emitSpread: 0.3
   surfaceThreshold: 0.35

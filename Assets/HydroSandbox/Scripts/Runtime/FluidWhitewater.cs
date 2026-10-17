@@ -19,14 +19,14 @@ namespace HydroSandbox
 
         [Header("Emission")]
         [Tooltip("Particles per second one fluid particle emits at full trapped-air potential (water colliding with water).")]
-        [SerializeField, Min(0f)] float trappedAirRate = 600f;
+        [SerializeField, Min(0f)] float trappedAirRate = 160f;
         [Tooltip("Trapped-air potential over which emission ramps from none to full.")]
-        [SerializeField] Vector2 trappedAirRange = new Vector2(2f, 15f);
+        [SerializeField] Vector2 trappedAirRange = new Vector2(8f, 30f);
         [Tooltip("Particles per second one fluid particle emits at full wave-crest potential (breaking crests).")]
-        [SerializeField, Min(0f)] float waveCrestRate = 300f;
+        [SerializeField, Min(0f)] float waveCrestRate = 250f;
         [SerializeField] Vector2 waveCrestRange = new Vector2(0.5f, 4f);
         [Tooltip("Kinetic energy per unit mass (0.5 v^2, m^2/s^2) over which emission fades in, so slow water never foams.")]
-        [SerializeField] Vector2 energyRange = new Vector2(0.5f, 5f);
+        [SerializeField] Vector2 energyRange = new Vector2(1.2f, 9f);
         [SerializeField, Range(1, 32)] int maxEmitPerParticle = 8;
         [Tooltip("Random sideways speed (m/s) given to new particles.")]
         [SerializeField, Min(0f)] float emitSpread = 0.3f;

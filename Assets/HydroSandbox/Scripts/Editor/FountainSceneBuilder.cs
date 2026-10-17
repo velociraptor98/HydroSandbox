@@ -75,8 +75,8 @@ namespace HydroSandbox.Editor
             camera.fieldOfView = 45f;
             camera.nearClipPlane = 0.05f;
             camera.farClipPlane = 200f;
-            camera.transform.position = new Vector3(0.55f, 1.55f, -1.9f);
-            camera.transform.LookAt(new Vector3(0f, 0.45f, 0f));
+            camera.transform.position = new Vector3(0.55f, 1.8f, -1.7f);
+            camera.transform.LookAt(new Vector3(0f, 0.4f, -0.05f));
             camera.GetUniversalAdditionalCameraData().renderPostProcessing = true;
 
             var profile = AssetDatabase.LoadAssetAtPath<VolumeProfile>("Assets/Settings/SampleSceneProfile.asset");
@@ -158,12 +158,26 @@ namespace HydroSandbox.Editor
             var whitewater = fluid.AddComponent<FluidWhitewater>();
             var whitewaterSo = new SerializedObject(whitewater);
             SetObject(whitewaterSo, "whitewaterShader", "Shaders/Compute/FluidWhitewater.compute");
+            // A 4 L/s jet is far gentler than a dam break: lower thresholds and a higher rate keep
+            // a steady plunge patch, and a short life keeps the surface current from piling foam
+            // up against the overflow lip.
+            whitewaterSo.FindProperty("trappedAirRange").vector2Value = new Vector2(3f, 15f);
+            whitewaterSo.FindProperty("trappedAirRate").floatValue = 2000f;
+            whitewaterSo.FindProperty("energyRange").vector2Value = new Vector2(0.8f, 6f);
+            whitewaterSo.FindProperty("lifetimeRange").vector2Value = new Vector2(0.6f, 1.8f);
+            whitewaterSo.FindProperty("maxEmitPerParticle").intValue = 16;
+            // About 40k are alive at steady state; a smaller ring saves dispatch and draw work.
+            whitewaterSo.FindProperty("capacity").intValue = 65536;
             whitewaterSo.ApplyModifiedPropertiesWithoutUndo();
 
             var surface = fluid.AddComponent<FluidSurface>();
             var surfaceSo = new SerializedObject(surface);
             surfaceSo.FindProperty("solver").objectReferenceValue = solver;
             surfaceSo.FindProperty("whitewater").objectReferenceValue = whitewater;
+            // The plunge packs tens of thousands of splats into a small patch; dimmer splats keep
+            // its edges translucent and lacy instead of saturating to a solid white blob.
+            surfaceSo.FindProperty("foamIntensity").floatValue = 0.22f;
+            surfaceSo.FindProperty("bubbleIntensity").floatValue = 0.14f;
             surfaceSo.FindProperty("surfaceShader").objectReferenceValue = Shader.Find("HydroSandbox/FluidSurface");
             SetObject(surfaceSo, "rippleNormal", "Textures/Water/WaterRipples_Normal.png");
             SetObject(surfaceSo, "foamMask", "Textures/Water/Foam002_Mask.png");
@@ -185,10 +199,11 @@ namespace HydroSandbox.Editor
             panelSo.FindProperty("viewMode").enumValueIndex = (int)FluidViewMode.Water;
             panelSo.ApplyModifiedPropertiesWithoutUndo();
 
-            // Pitched 10 degrees down, pointing out of the wall (-Z).
+            // Pitched 30 degrees down, pointing out of the wall (-Z), so the jet lands mid-basin
+            // where the plunge is visible over the front rim.
             var source = new GameObject("SpoutSource").AddComponent<FluidSource>();
             source.transform.position = new Vector3(0f, SpoutHeight, z - 0.19f);
-            source.transform.rotation = Quaternion.Euler(10f, 180f, 0f);
+            source.transform.rotation = Quaternion.Euler(30f, 180f, 0f);
             var sourceSo = new SerializedObject(source);
             sourceSo.FindProperty("shape").enumValueIndex = (int)FluidSourceShape.Area;
             sourceSo.FindProperty("size").floatValue = 0.07f;
