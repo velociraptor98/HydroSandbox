@@ -25,11 +25,6 @@ float _Cohesion;
 float _SCorrK;
 float _SCorrInvWdq;
 float _Viscosity;
-float _AerationImpactMin;
-float _AerationImpactRange;
-float _AerationDecay;
-float _AerationBuoyancy;
-float _AerationDiffusion;
 
 float3 _ContainerMin;
 float3 _ContainerMax;
@@ -44,13 +39,6 @@ StructuredBuffer<uint> _FluidState;
 bool IsAlive(float4 p)
 {
     return p.w > 0.5;
-}
-
-// 0 for particles in air (stream, spray: well under rest density), 1 once inside the body of
-// water. Bubbles only float, and air is only entrained, where the water is submerged.
-float Submersion(float density)
-{
-    return saturate((density * _InvRestDensity - 0.75) * 5.0);
 }
 
 float Poly6(float r2)

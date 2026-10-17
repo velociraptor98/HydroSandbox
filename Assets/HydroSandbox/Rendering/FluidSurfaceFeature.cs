@@ -41,6 +41,8 @@ namespace HydroSandbox.Rendering
         const int ThicknessPass = 1;
         const int BlurPass = 2;
         const int CompositePass = 3;
+        const int WhitewaterSplatPass = 4;
+        const int WhitewaterCompositePass = 5;
         const float NoFluidDepth = 1e6f;
 
         static readonly int SceneDepthId = Shader.PropertyToID("_SceneDepth");
@@ -49,6 +51,7 @@ namespace HydroSandbox.Rendering
         static readonly int FluidThicknessId = Shader.PropertyToID("_FluidThickness");
         static readonly int BlurSourceId = Shader.PropertyToID("_BlurSource");
         static readonly int BlurDirectionId = Shader.PropertyToID("_BlurDirection");
+        static readonly int WhitewaterId = Shader.PropertyToID("_Whitewater");
 
         readonly MaterialPropertyBlock properties = new MaterialPropertyBlock();
 
@@ -63,6 +66,7 @@ namespace HydroSandbox.Rendering
             internal TextureHandle fluidDepth;
             internal TextureHandle fluidThickness;
             internal TextureHandle blurSource;
+            internal TextureHandle whitewater;
             internal Vector2 blurDirection;
         }
 
@@ -94,7 +98,7 @@ namespace HydroSandbox.Rendering
                 new Color(NoFluidDepth, 0, 0, 0));
             TextureHandle blurTemp = CreateColor(renderGraph, width, height, GraphicsFormat.R32_SFloat, "_FluidDepthBlurH", null);
             TextureHandle blurred = CreateColor(renderGraph, width, height, GraphicsFormat.R32_SFloat, "_FluidDepthBlurred", null);
-            TextureHandle thickness = CreateColor(renderGraph, width, height, GraphicsFormat.R16G16B16A16_SFloat, "_FluidThickness", Color.clear);
+            TextureHandle thickness = CreateColor(renderGraph, width, height, GraphicsFormat.R16G16_SFloat, "_FluidThickness", Color.clear);
             var zDesc = new TextureDesc(width, height)
             {
                 depthBufferBits = DepthBits.Depth32,
@@ -167,6 +171,48 @@ namespace HydroSandbox.Rendering
                     d.properties.SetTexture(FluidDepthId, d.fluidDepth);
                     d.properties.SetTexture(FluidThicknessId, d.fluidThickness);
                     ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, CompositePass, MeshTopology.Triangles, 3, 1, d.properties);
+                });
+            }
+
+            if (surface.Whitewater != null)
+                RecordWhitewater(renderGraph, resources, surface, material, blurred, width, height);
+        }
+
+        void RecordWhitewater(RenderGraph renderGraph, UniversalResourceData resources, FluidSurface surface,
+            Material material, TextureHandle fluidDepth, int width, int height)
+        {
+            TextureHandle whitewater = CreateColor(renderGraph, width, height, GraphicsFormat.R16G16_SFloat, "_Whitewater", Color.clear);
+
+            using (var builder = renderGraph.AddRasterRenderPass<PassData>("Whitewater Splats", out var data, profilingSampler))
+            {
+                Fill(data, surface, material, surface.Whitewater.Capacity);
+                data.sceneDepth = resources.cameraDepthTexture;
+                data.fluidDepth = fluidDepth;
+                builder.UseTexture(data.sceneDepth, AccessFlags.Read);
+                builder.UseTexture(data.fluidDepth, AccessFlags.Read);
+                builder.SetRenderAttachment(whitewater, 0, AccessFlags.Write);
+                builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
+                {
+                    d.properties.Clear();
+                    d.surface.SetWhitewaterSplatProperties(d.properties);
+                    d.properties.SetTexture(SceneDepthId, d.sceneDepth);
+                    d.properties.SetTexture(FluidDepthId, d.fluidDepth);
+                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterSplatPass, MeshTopology.Triangles, 6, d.instanceCount, d.properties);
+                });
+            }
+
+            using (var builder = renderGraph.AddRasterRenderPass<PassData>("Whitewater Composite", out var data, profilingSampler))
+            {
+                Fill(data, surface, material, 0);
+                data.whitewater = whitewater;
+                builder.UseTexture(data.whitewater, AccessFlags.Read);
+                builder.SetRenderAttachment(resources.activeColorTexture, 0, AccessFlags.ReadWrite);
+                builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
+                {
+                    d.properties.Clear();
+                    d.surface.SetWhitewaterCompositeProperties(d.properties);
+                    d.properties.SetTexture(WhitewaterId, d.whitewater);
+                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterCompositePass, MeshTopology.Triangles, 3, 1, d.properties);
                 });
             }
         }

@@ -97,8 +97,15 @@ namespace HydroSandbox
 
         public float ParticleRadius => settings.particleRadius;
         public GraphicsBuffer PositionBuffer => positions;
-        /// <summary>xyz = velocity, w = aeration (0..1).</summary>
         public GraphicsBuffer VelocityBuffer => velocities;
+
+        // Last substep's sorted state, for passes that run after the solve (whitewater).
+        internal GraphicsBuffer FluidStateBuffer => fluidState;
+        internal GraphicsBuffer NeighborListBuffer => neighborList;
+        internal GraphicsBuffer NeighborCountBuffer => neighborCount;
+        internal GraphicsBuffer CellStartBuffer => cellStart;
+        internal GraphicsBuffer CellCountBuffer => cellCount;
+        internal GraphicsBuffer SortedCellIdBuffer => sortedCellId;
         public float GpuSolveMilliseconds { get; private set; }
         public bool HasGpuSolveTiming => SystemInfo.supportsGpuRecorder;
 
@@ -130,6 +137,8 @@ namespace HydroSandbox
             ReleaseBuffers();
             AllocateBuffers();
             UploadInitialState();
+            if (TryGetComponent(out FluidWhitewater whitewater))
+                whitewater.Clear();
         }
 
         void OnEnable()
@@ -182,6 +191,8 @@ namespace HydroSandbox
             RecordEmission(settings.timeStep);
             for (int i = 0; i < substeps; i++)
                 RecordSubstep();
+            if (TryGetComponent(out FluidWhitewater whitewater) && whitewater.isActiveAndEnabled)
+                whitewater.Record(cmd, this, settings.timeStep, frameIndex);
             cmd.EndSample(solveSampler);
             Graphics.ExecuteCommandBuffer(cmd);
 
@@ -361,6 +372,13 @@ namespace HydroSandbox
 
         void PushParameters(float dt)
         {
+            foreach (var cs in new[] { predictShader, neighborSearchShader, neighborListShader, densityConstraintShader, collisionShader, velocityShader, emissionShader })
+                PushShaderParameters(cmd, cs, dt);
+        }
+
+        /// <summary>Records the solver's shared shader parameters for one compute shader.</summary>
+        internal void PushShaderParameters(CommandBuffer cmd, ComputeShader cs, float dt)
+        {
             float r = settings.particleRadius;
             float h = settings.SmoothingRadius;
             float h2 = h * h;
@@ -369,36 +387,28 @@ namespace HydroSandbox
             float wDeltaQ = poly6 * Mathf.Pow(h2 - deltaQ2, 3);
             Vector3 inset = Vector3.one * r;
 
-            foreach (var cs in new[] { predictShader, neighborSearchShader, neighborListShader, densityConstraintShader, collisionShader, velocityShader, emissionShader })
-            {
-                cmd.SetComputeIntParam(cs, Ids.ParticleCount, poolSize);
-                cmd.SetComputeFloatParam(cs, Ids.DeltaTime, dt);
-                cmd.SetComputeVectorParam(cs, Ids.Gravity, settings.gravity);
-                cmd.SetComputeFloatParam(cs, Ids.MaxSpeed, settings.maxSpeed);
-                cmd.SetComputeFloatParam(cs, Ids.SmoothingRadius, h);
-                cmd.SetComputeFloatParam(cs, Ids.SmoothingRadiusSq, h2);
-                cmd.SetComputeFloatParam(cs, Ids.InvCellSize, 1f / h);
-                cmd.SetComputeIntParam(cs, Ids.GridBitsX, gridBitsX);
-                cmd.SetComputeIntParam(cs, Ids.GridBitsY, gridBitsY);
-                cmd.SetComputeIntParam(cs, Ids.GridBitsZ, gridBitsZ);
-                cmd.SetComputeIntParam(cs, Ids.HashTableSize, hashTableSize);
-                cmd.SetComputeFloatParam(cs, Ids.ParticleMass, ParticleMass(h, settings.ParticleSpacing));
-                cmd.SetComputeFloatParam(cs, Ids.InvRestDensity, 1f / settings.restDensity);
-                cmd.SetComputeFloatParam(cs, Ids.Poly6Coeff, poly6);
-                cmd.SetComputeFloatParam(cs, Ids.SpikyGradCoeff, -45f / (Mathf.PI * Mathf.Pow(h, 6)));
-                cmd.SetComputeFloatParam(cs, Ids.ConstraintRelaxation, settings.constraintRelaxation / h2);
-                cmd.SetComputeFloatParam(cs, Ids.Cohesion, settings.cohesion);
-                cmd.SetComputeFloatParam(cs, Ids.SCorrK, settings.artificialPressure * h2);
-                cmd.SetComputeFloatParam(cs, Ids.SCorrInvWdq, 1f / wDeltaQ);
-                cmd.SetComputeFloatParam(cs, Ids.Viscosity, settings.viscosity);
-                cmd.SetComputeFloatParam(cs, Ids.AerationImpactMin, settings.aerationImpactMin);
-                cmd.SetComputeFloatParam(cs, Ids.AerationImpactRange, settings.aerationImpactRange);
-                cmd.SetComputeFloatParam(cs, Ids.AerationDecay, settings.aerationDecay);
-                cmd.SetComputeFloatParam(cs, Ids.AerationBuoyancy, settings.aerationBuoyancy);
-                cmd.SetComputeFloatParam(cs, Ids.AerationDiffusion, settings.aerationDiffusion);
-                cmd.SetComputeVectorParam(cs, Ids.ContainerMin, container.min + inset);
-                cmd.SetComputeVectorParam(cs, Ids.ContainerMax, container.max - inset);
-            }
+            cmd.SetComputeIntParam(cs, Ids.ParticleCount, poolSize);
+            cmd.SetComputeFloatParam(cs, Ids.DeltaTime, dt);
+            cmd.SetComputeVectorParam(cs, Ids.Gravity, settings.gravity);
+            cmd.SetComputeFloatParam(cs, Ids.MaxSpeed, settings.maxSpeed);
+            cmd.SetComputeFloatParam(cs, Ids.SmoothingRadius, h);
+            cmd.SetComputeFloatParam(cs, Ids.SmoothingRadiusSq, h2);
+            cmd.SetComputeFloatParam(cs, Ids.InvCellSize, 1f / h);
+            cmd.SetComputeIntParam(cs, Ids.GridBitsX, gridBitsX);
+            cmd.SetComputeIntParam(cs, Ids.GridBitsY, gridBitsY);
+            cmd.SetComputeIntParam(cs, Ids.GridBitsZ, gridBitsZ);
+            cmd.SetComputeIntParam(cs, Ids.HashTableSize, hashTableSize);
+            cmd.SetComputeFloatParam(cs, Ids.ParticleMass, ParticleMass(h, settings.ParticleSpacing));
+            cmd.SetComputeFloatParam(cs, Ids.InvRestDensity, 1f / settings.restDensity);
+            cmd.SetComputeFloatParam(cs, Ids.Poly6Coeff, poly6);
+            cmd.SetComputeFloatParam(cs, Ids.SpikyGradCoeff, -45f / (Mathf.PI * Mathf.Pow(h, 6)));
+            cmd.SetComputeFloatParam(cs, Ids.ConstraintRelaxation, settings.constraintRelaxation / h2);
+            cmd.SetComputeFloatParam(cs, Ids.Cohesion, settings.cohesion);
+            cmd.SetComputeFloatParam(cs, Ids.SCorrK, settings.artificialPressure * h2);
+            cmd.SetComputeFloatParam(cs, Ids.SCorrInvWdq, 1f / wDeltaQ);
+            cmd.SetComputeFloatParam(cs, Ids.Viscosity, settings.viscosity);
+            cmd.SetComputeVectorParam(cs, Ids.ContainerMin, container.min + inset);
+            cmd.SetComputeVectorParam(cs, Ids.ContainerMax, container.max - inset);
         }
 
         void RecordEmission(float dt)
@@ -465,7 +475,6 @@ namespace HydroSandbox
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Positions, positions);
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Velocities, velocities);
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Predicted, predicted);
-            cmd.SetComputeBufferParam(ps, predictKernel, Ids.Density, density);
             DispatchParticles(ps, predictKernel);
 
             // Also before the neighbor search: the neighbor list is fixed for the substep, so
@@ -507,7 +516,6 @@ namespace HydroSandbox
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Positions, positions);
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Velocities, velocities);
-            cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Density, density);
             DispatchParticles(vs, updateVelocityKernel);
 
             BindNeighborList(vs, viscosityKernel);
@@ -632,11 +640,6 @@ namespace HydroSandbox
             public static readonly int SCorrK = Shader.PropertyToID("_SCorrK");
             public static readonly int SCorrInvWdq = Shader.PropertyToID("_SCorrInvWdq");
             public static readonly int Viscosity = Shader.PropertyToID("_Viscosity");
-            public static readonly int AerationImpactMin = Shader.PropertyToID("_AerationImpactMin");
-            public static readonly int AerationImpactRange = Shader.PropertyToID("_AerationImpactRange");
-            public static readonly int AerationDecay = Shader.PropertyToID("_AerationDecay");
-            public static readonly int AerationBuoyancy = Shader.PropertyToID("_AerationBuoyancy");
-            public static readonly int AerationDiffusion = Shader.PropertyToID("_AerationDiffusion");
             public static readonly int ContainerMin = Shader.PropertyToID("_ContainerMin");
             public static readonly int ContainerMax = Shader.PropertyToID("_ContainerMax");
 

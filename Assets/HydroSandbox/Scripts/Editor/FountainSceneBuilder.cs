@@ -155,13 +155,18 @@ namespace HydroSandbox.Editor
             so.FindProperty("settings.cohesion").floatValue = 0.3f;
             so.ApplyModifiedPropertiesWithoutUndo();
 
+            var whitewater = fluid.AddComponent<FluidWhitewater>();
+            var whitewaterSo = new SerializedObject(whitewater);
+            SetObject(whitewaterSo, "whitewaterShader", "Shaders/Compute/FluidWhitewater.compute");
+            whitewaterSo.ApplyModifiedPropertiesWithoutUndo();
+
             var surface = fluid.AddComponent<FluidSurface>();
             var surfaceSo = new SerializedObject(surface);
             surfaceSo.FindProperty("solver").objectReferenceValue = solver;
+            surfaceSo.FindProperty("whitewater").objectReferenceValue = whitewater;
             surfaceSo.FindProperty("surfaceShader").objectReferenceValue = Shader.Find("HydroSandbox/FluidSurface");
             SetObject(surfaceSo, "rippleNormal", "Textures/Water/WaterRipples_Normal.png");
             SetObject(surfaceSo, "foamMask", "Textures/Water/Foam002_Mask.png");
-            SetObject(surfaceSo, "foamColor", "Textures/Water/Foam002_Color.png");
             surfaceSo.ApplyModifiedPropertiesWithoutUndo();
 
             var debugRenderer = fluid.AddComponent<FluidDebugRenderer>();

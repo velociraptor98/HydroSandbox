@@ -1,0 +1,215 @@
+// Secondary whitewater particles (spray, foam, bubbles) after Ihmsen et al. 2012, "Unified Spray,
+// Foam and Bubbles for Particle-Based Fluids". Runs once per frame after the last substep, using
+// that substep's sorted particle order, neighbor list and grid.
+//   SurfaceNormals   outward normal per fluid particle (color-field gradient)
+//   EmitWhitewater   trapped-air and wave-crest potentials, scaled by kinetic energy, emit
+//                    particles into a ring buffer (the oldest are overwritten when it is full)
+//   AdvectWhitewater classify by fluid neighbor count: spray is ballistic, foam rides the
+//                    surface flow and fades, bubbles rise
+
+#pragma kernel SurfaceNormals
+#pragma kernel EmitWhitewater
+#pragma kernel AdvectWhitewater
+
+#include "FluidGrid.hlsl"
+#include "FluidNeighbors.hlsl"
+
+#define TYPE_SPRAY 0
+#define TYPE_FOAM 1
+#define TYPE_BUBBLE 2
+
+StructuredBuffer<float4> _Positions;
+StructuredBuffer<float4> _Velocities;
+RWStructuredBuffer<float4> _SurfaceNormals;     // xyz outward unit normal, w = |gradient| * h
+
+// Whitewater pool: position.w = remaining life (s, <= 0 is dead), velocity.w = type.
+RWStructuredBuffer<float4> _WhitewaterPositions;
+RWStructuredBuffer<float4> _WhitewaterVelocities;
+RWStructuredBuffer<uint> _WhitewaterState;      // [0] = ring head, monotonically increasing
+
+uint _WhitewaterCapacity;
+float _FrameDeltaTime;
+uint _FrameSeed;
+float _ParticleRadius;
+float _SurfaceThreshold;
+
+float2 _TrappedAirRange;
+float2 _WaveCrestRange;
+float2 _EnergyRange;
+float _TrappedAirRate;
+float _WaveCrestRate;
+uint _MaxEmitPerParticle;
+float _EmitSpread;
+float2 _LifetimeRange;
+
+float _SprayDrag;
+float _BubbleBuoyancy;
+float _BubbleDrag;
+uint _SprayMaxNeighbors;
+uint _BubbleMinNeighbors;
+
+float Random01(uint seed)
+{
+    return WangHash(seed) * (1.0 / 4294967295.0);
+}
+
+// Ihmsen's clamping function: 0 below the range, 1 above it, linear in between.
+float Potential(float value, float2 range)
+{
+    return saturate((value - range.x) / (range.y - range.x));
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SurfaceNormals(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _FluidState[0])
+        return;
+
+    float3 pi = _Positions[i].xyz;
+    float massOverRest = _ParticleMass * _InvRestDensity;
+    float3 gradient = 0;
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Positions[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        gradient += massOverRest * SpikyGradient(r, r2, i, j);
+    END_FOR_EACH_NEIGHBOR
+
+    // The color-field gradient points into the fluid; the surface normal points out of it. Its
+    // magnitude is near zero inside the body and about 1/h at the surface.
+    float len = length(gradient);
+    _SurfaceNormals[i] = float4(len > 1e-6 ? -gradient / len : 0, len * _SmoothingRadius);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void EmitWhitewater(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _FluidState[0])
+        return;
+
+    float3 pi = _Positions[i].xyz;
+    float3 vi = _Velocities[i].xyz;
+    float speed = length(vi);
+    float energy = 0.5 * speed * speed;
+    if (energy <= _EnergyRange.x)
+        return;
+
+    float4 ni = _SurfaceNormals[i];
+    bool onSurface = ni.w > _SurfaceThreshold;
+    float trappedAir = 0;
+    float curvature = 0;
+
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 xij = pi - _Positions[j].xyz;
+        float r2 = dot(xij, xij);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        float r = sqrt(r2);
+        float w = 1.0 - r / _SmoothingRadius;
+
+        // Trapped air: neighbors moving toward each other fast, as when a jet hits a pool.
+        float3 vij = vi - _Velocities[j].xyz;
+        float vLen = length(vij);
+        if (vLen > 1e-5 && r > 1e-6)
+            trappedAir += vLen * (1.0 - dot(vij / vLen, xij / r)) * w;
+
+        // Wave crest: normals diverging over a convex surface (neighbors lie behind i).
+        float4 nj = _SurfaceNormals[j];
+        if (onSurface && nj.w > _SurfaceThreshold && dot(-xij, ni.xyz) < 0.0)
+            curvature += (1.0 - dot(ni.xyz, nj.xyz)) * w;
+    END_FOR_EACH_NEIGHBOR
+
+    // Crests only break while the surface moves outward.
+    if (!onSurface || speed < 1e-5 || dot(vi / speed, ni.xyz) < 0.6)
+        curvature = 0;
+
+    float rate = (_TrappedAirRate * Potential(trappedAir, _TrappedAirRange)
+                + _WaveCrestRate * Potential(curvature, _WaveCrestRange))
+               * Potential(energy, _EnergyRange);
+    float expected = rate * _FrameDeltaTime;
+    uint seed = i * 9781u + _FrameSeed * 6271u;
+    uint count = (uint)expected + (Random01(seed) < frac(expected) ? 1u : 0u);
+    count = min(count, _MaxEmitPerParticle);
+    if (count == 0)
+        return;
+
+    uint start;
+    InterlockedAdd(_WhitewaterState[0], count, start);
+
+    // Spawn inside a cylinder around the particle along this frame's travel, so emission from a
+    // fast particle forms a streak instead of a point.
+    float3 dir = vi / speed;
+    float3 e1 = normalize(abs(dir.y) < 0.99 ? cross(dir, float3(0, 1, 0)) : cross(dir, float3(1, 0, 0)));
+    float3 e2 = cross(dir, e1);
+    for (uint k = 0; k < count; k++)
+    {
+        uint s = seed + k * 104729u;
+        float radial = sqrt(Random01(s + 1u));
+        float angle = 6.2831853 * Random01(s + 2u);
+        float along = Random01(s + 3u) * speed * _FrameDeltaTime;
+        float3 lateral = (cos(angle) * e1 + sin(angle) * e2) * radial;
+        float life = lerp(_LifetimeRange.x, _LifetimeRange.y, Random01(s + 4u));
+
+        uint slot = (start + k) % _WhitewaterCapacity;
+        _WhitewaterPositions[slot] = float4(pi + lateral * _ParticleRadius + dir * along, life);
+        _WhitewaterVelocities[slot] = float4(vi + lateral * _EmitSpread, TYPE_SPRAY);
+    }
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void AdvectWhitewater(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= _WhitewaterCapacity)
+        return;
+    float4 p = _WhitewaterPositions[slot];
+    if (p.w <= 0)
+        return;
+    float3 v = _WhitewaterVelocities[slot].xyz;
+
+    uint neighbors = 0;
+    float3 velocitySum = 0;
+    float weightSum = 0;
+    FOR_EACH_GRID_NEIGHBOR(p.xyz, j)
+        float3 r = p.xyz - _Positions[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        float w = 1.0 - sqrt(r2) / _SmoothingRadius;
+        velocitySum += _Velocities[j].xyz * w;
+        weightSum += w;
+        neighbors++;
+    END_FOR_EACH_GRID_NEIGHBOR
+    float3 fluidVelocity = weightSum > 0 ? velocitySum / weightSum : 0;
+
+    float dt = _FrameDeltaTime;
+    uint type;
+    float aging;
+    if (neighbors < _SprayMaxNeighbors)
+    {
+        type = TYPE_SPRAY;
+        v = (v + _Gravity * dt) * saturate(1.0 - _SprayDrag * dt);
+        aging = 0.3;
+    }
+    else if (neighbors > _BubbleMinNeighbors)
+    {
+        type = TYPE_BUBBLE;
+        v += -_BubbleBuoyancy * _Gravity * dt + _BubbleDrag * (fluidVelocity - v);
+        aging = 0.3;
+    }
+    else
+    {
+        // Foam rides the surface flow and is what actually dissipates; spray and bubbles mostly
+        // turn into foam first, so they age slowly.
+        type = TYPE_FOAM;
+        v = fluidVelocity;
+        aging = 1.0;
+    }
+
+    float3 position = clamp(p.xyz + v * dt, _ContainerMin, _ContainerMax);
+    _WhitewaterPositions[slot] = float4(position, p.w - dt * aging);
+    _WhitewaterVelocities[slot] = float4(v, type);
+}

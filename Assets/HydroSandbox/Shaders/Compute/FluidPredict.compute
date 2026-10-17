@@ -3,7 +3,6 @@
 #include "FluidCommon.hlsl"
 
 StructuredBuffer<float4> _Positions;
-StructuredBuffer<float> _Density;
 RWStructuredBuffer<float4> _Velocities;
 RWStructuredBuffer<float4> _Predicted;
 
@@ -17,11 +16,7 @@ void Predict(uint3 id : SV_DispatchThreadID)
     if (!IsAlive(p))
         return;
 
-    float4 velocity = _Velocities[i];
-    // Entrained air makes submerged aerated water lighter, so plunged bubbles rise back up.
-    // _Density is from the previous substep, in the same (unsorted since) particle order.
-    float buoyancy = velocity.w * _AerationBuoyancy * Submersion(_Density[i]);
-    float3 v = velocity.xyz + _Gravity * ((1.0 - buoyancy) * _DeltaTime);
-    _Velocities[i] = float4(v, velocity.w);
+    float3 v = _Velocities[i].xyz + _Gravity * _DeltaTime;
+    _Velocities[i] = float4(v, 0);
     _Predicted[i] = float4(p.xyz + v * _DeltaTime, p.w);
 }

@@ -7,7 +7,6 @@ RWStructuredBuffer<float4> _Positions;
 RWStructuredBuffer<float4> _Predicted;
 RWStructuredBuffer<float4> _Velocities;
 RWStructuredBuffer<float4> _VelocitiesOut;
-StructuredBuffer<float> _Density;
 
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void UpdateVelocity(uint3 id : SV_DispatchThreadID)
@@ -17,27 +16,17 @@ void UpdateVelocity(uint3 id : SV_DispatchThreadID)
         return;
 
     float4 predicted = _Predicted[i];
-    float4 freeVelocity = _Velocities[i];
     float3 v = (predicted.xyz - _Positions[i].xyz) / _DeltaTime;
     float speed = length(v);
     if (speed > _MaxSpeed)
         v *= _MaxSpeed / speed;
 
-    // Aeration (velocity.w): entrained air that the renderer shows as foam and bubbles. Air is
-    // trapped where the constraints abruptly change a particle's velocity (a jet plunging into
-    // the pool, a splash hitting a wall), not by speed alone, so a free-falling stream stays
-    // glassy. It then fades exponentially so foam lingers after the impact.
-    float impact = length(v - freeVelocity.xyz);
-    float aeration = freeVelocity.w * exp(-_AerationDecay * _DeltaTime);
-    float entrained = saturate((impact - _AerationImpactMin) / _AerationImpactRange) * Submersion(_Density[i]);
-    aeration = max(aeration, entrained);
-    _Velocities[i] = float4(v, aeration);
+    _Velocities[i] = float4(v, 0);
     _Positions[i] = predicted;
 }
 
-// XSPH: blend each velocity toward its kernel-weighted neighborhood average, and diffuse
-// aeration the same way so air spreads out from an impact. Written to a second buffer because
-// neighbors read the unsmoothed values.
+// XSPH: blend each velocity toward its kernel-weighted neighborhood average. Written to a
+// second buffer because neighbors read the unsmoothed velocities.
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void ApplyViscosity(uint3 id : SV_DispatchThreadID)
 {
@@ -46,24 +35,17 @@ void ApplyViscosity(uint3 id : SV_DispatchThreadID)
         return;
 
     float3 pi = _Predicted[i].xyz;
-    float4 velocityI = _Velocities[i];
-    float3 vi = velocityI.xyz;
+    float3 vi = _Velocities[i].xyz;
     float3 sum = 0;
-    float aerationSum = 0;
 
     FOR_EACH_NEIGHBOR(i, j)
         float3 r = pi - _Predicted[j].xyz;
         float r2 = dot(r, r);
         if (r2 >= _SmoothingRadiusSq)
             continue;
-        float4 velocityJ = _Velocities[j];
-        float w = Poly6(r2);
-        sum += (velocityJ.xyz - vi) * w;
-        aerationSum += (velocityJ.w - velocityI.w) * w;
+        sum += (_Velocities[j].xyz - vi) * Poly6(r2);
     END_FOR_EACH_NEIGHBOR
 
-    float massOverRest = _ParticleMass * _InvRestDensity;
-    float3 v = vi + _Viscosity * massOverRest * sum;
-    float aeration = saturate(velocityI.w + _AerationDiffusion * massOverRest * aerationSum);
-    _VelocitiesOut[i] = float4(v, aeration);
+    float3 v = vi + _Viscosity * (_ParticleMass * _InvRestDensity) * sum;
+    _VelocitiesOut[i] = float4(v, 0);
 }

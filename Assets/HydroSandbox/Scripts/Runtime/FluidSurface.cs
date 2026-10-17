@@ -12,6 +12,8 @@ namespace HydroSandbox
         public static readonly List<FluidSurface> Active = new List<FluidSurface>();
 
         [SerializeField] FluidSolver solver;
+        [Tooltip("Optional spray/foam/bubble particles drawn over the water.")]
+        [SerializeField] FluidWhitewater whitewater;
         [SerializeField] Shader surfaceShader;
 
         [Header("Surface Reconstruction")]
@@ -49,24 +51,28 @@ namespace HydroSandbox
         [SerializeField, Min(0.01f)] float flowSpeedRange = 2f;
         [SerializeField, Range(0f, 1f)] float flowSheen = 0.35f;
 
-        [Header("Foam")]
+        [Header("Whitewater")]
+        [Tooltip("Splat radius of one whitewater particle, as a multiple of fluid particle radius.")]
+        [SerializeField, Range(0.05f, 2f)] float whitewaterRadius = 0.4f;
+        [Tooltip("Splats never shrink below this many pixels; smaller ones are dimmed instead.")]
+        [SerializeField, Range(0.5f, 4f)] float whitewaterMinPixels = 1.2f;
+        [SerializeField, Min(0f)] float sprayIntensity = 0.5f;
+        [SerializeField, Min(0f)] float foamIntensity = 0.45f;
+        [SerializeField, Min(0f)] float bubbleIntensity = 0.3f;
+        [Tooltip("How quickly submerged bubbles fade with depth below the surface, per meter.")]
+        [SerializeField, Min(0f)] float bubbleAttenuation = 6f;
+        [Tooltip("Photographed foam lace that breaks surface foam into strands.")]
         [SerializeField] Texture2D foamMask;
-        [SerializeField] Texture2D foamColor;
-        [SerializeField] Color foamTint = new Color(0.95f, 0.97f, 1f);
-        [Tooltip("Foam texture repeats per meter.")]
+        [Tooltip("Foam lace repeats per meter.")]
         [SerializeField, Min(0.01f)] float foamScale = 3f;
-        [Tooltip("Foam coverage per meter of aerated water at the surface.")]
-        [SerializeField, Min(0f)] float foamAmount = 40f;
-        [Tooltip("Whitening per meter of aerated water anywhere along the view ray (submerged bubble plumes).")]
-        [SerializeField, Min(0f)] float bubbleAmount = 12f;
-        [Tooltip("How deep below the visible surface aerated water still shows as foam, in particle radii.")]
-        [SerializeField, Range(0.5f, 10f)] float foamDepth = 3f;
+        [SerializeField] Color foamTint = new Color(0.95f, 0.97f, 1f);
 
         Material material;
         static readonly Vector3[] AmbientDirections = { Vector3.up, Vector3.right, Vector3.down };
         readonly Color[] ambientColors = new Color[3];
 
         public FluidSolver Solver => solver;
+        public FluidWhitewater Whitewater => whitewater != null && whitewater.isActiveAndEnabled && whitewater.IsReady ? whitewater : null;
         public int BlurIterations => blurIterations;
         public bool IsRenderable => isActiveAndEnabled && solver != null && solver.IsReady && surfaceShader != null;
 
@@ -98,7 +104,6 @@ namespace HydroSandbox
             properties.SetFloat(Ids.ParticleRadius, solver.ParticleRadius);
             properties.SetFloat(Ids.DepthRadiusScale, depthRadiusScale);
             properties.SetFloat(Ids.ThicknessScale, thicknessScale);
-            properties.SetFloat(Ids.FoamDepthFalloff, foamDepth * solver.ParticleRadius);
         }
 
         public void SetBlurProperties(MaterialPropertyBlock properties)
@@ -110,10 +115,7 @@ namespace HydroSandbox
 
         public void SetCompositeProperties(MaterialPropertyBlock properties)
         {
-            RenderSettings.ambientProbe.Evaluate(AmbientDirections, ambientColors);
-            properties.SetColor(Ids.AmbientUp, ambientColors[0] * RenderSettings.ambientIntensity);
-            properties.SetColor(Ids.AmbientHorizon, ambientColors[1] * RenderSettings.ambientIntensity);
-            properties.SetColor(Ids.AmbientDown, ambientColors[2] * RenderSettings.ambientIntensity);
+            SetAmbientProperties(properties);
             properties.SetVector(Ids.AbsorptionCoefficients, absorption);
             properties.SetColor(Ids.ScatterColor, scatterColor);
             properties.SetFloat(Ids.RefractionStrength, refractionStrength);
@@ -123,15 +125,38 @@ namespace HydroSandbox
             properties.SetFloat(Ids.RippleStrength, rippleNormal != null ? rippleStrength : 0f);
             properties.SetFloat(Ids.RippleScale, rippleScale);
             properties.SetFloat(Ids.RippleSpeed, rippleSpeed);
-            properties.SetTexture(Ids.FoamMask, foamMask != null ? foamMask : Texture2D.whiteTexture);
-            properties.SetTexture(Ids.FoamColor, foamColor != null ? foamColor : Texture2D.whiteTexture);
-            properties.SetColor(Ids.FoamTint, foamTint);
-            properties.SetFloat(Ids.FoamScale, foamScale);
-            properties.SetFloat(Ids.FoamAmount, foamAmount);
-            properties.SetFloat(Ids.BubbleAmount, bubbleAmount);
             properties.SetFloat(Ids.FlowSpeedMin, flowSpeedMin);
             properties.SetFloat(Ids.FlowSpeedRange, flowSpeedRange);
             properties.SetFloat(Ids.FlowSheen, flowSheen);
+        }
+
+        public void SetWhitewaterSplatProperties(MaterialPropertyBlock properties)
+        {
+            properties.SetBuffer(Ids.WhitewaterPositions, whitewater.PositionBuffer);
+            properties.SetBuffer(Ids.WhitewaterVelocities, whitewater.VelocityBuffer);
+            properties.SetFloat(Ids.WhitewaterRadius, whitewaterRadius * solver.ParticleRadius);
+            properties.SetFloat(Ids.WhitewaterMinPixels, whitewaterMinPixels);
+            properties.SetFloat(Ids.SprayIntensity, sprayIntensity);
+            properties.SetFloat(Ids.FoamIntensity, foamIntensity);
+            properties.SetFloat(Ids.BubbleIntensity, bubbleIntensity);
+            properties.SetFloat(Ids.BubbleAttenuation, bubbleAttenuation);
+            properties.SetTexture(Ids.FoamMask, foamMask != null ? foamMask : Texture2D.whiteTexture);
+            properties.SetFloat(Ids.FoamScale, foamScale);
+        }
+
+        public void SetWhitewaterCompositeProperties(MaterialPropertyBlock properties)
+        {
+            SetAmbientProperties(properties);
+            properties.SetColor(Ids.FoamTint, foamTint);
+            properties.SetColor(Ids.ScatterColor, scatterColor);
+        }
+
+        void SetAmbientProperties(MaterialPropertyBlock properties)
+        {
+            RenderSettings.ambientProbe.Evaluate(AmbientDirections, ambientColors);
+            properties.SetColor(Ids.AmbientUp, ambientColors[0] * RenderSettings.ambientIntensity);
+            properties.SetColor(Ids.AmbientHorizon, ambientColors[1] * RenderSettings.ambientIntensity);
+            properties.SetColor(Ids.AmbientDown, ambientColors[2] * RenderSettings.ambientIntensity);
         }
 
         static class Ids
@@ -141,7 +166,6 @@ namespace HydroSandbox
             public static readonly int ParticleRadius = Shader.PropertyToID("_ParticleRadius");
             public static readonly int DepthRadiusScale = Shader.PropertyToID("_DepthRadiusScale");
             public static readonly int ThicknessScale = Shader.PropertyToID("_ThicknessScale");
-            public static readonly int FoamDepthFalloff = Shader.PropertyToID("_FoamDepthFalloff");
             public static readonly int BlurWorldRadius = Shader.PropertyToID("_BlurWorldRadius");
             public static readonly int BlurDepthFalloff = Shader.PropertyToID("_BlurDepthFalloff");
             public static readonly int BlurMaxRadius = Shader.PropertyToID("_BlurMaxRadius");
@@ -158,14 +182,19 @@ namespace HydroSandbox
             public static readonly int RippleScale = Shader.PropertyToID("_RippleScale");
             public static readonly int RippleSpeed = Shader.PropertyToID("_RippleSpeed");
             public static readonly int FoamMask = Shader.PropertyToID("_FoamMask");
-            public static readonly int FoamColor = Shader.PropertyToID("_FoamColor");
             public static readonly int FoamTint = Shader.PropertyToID("_FoamTint");
             public static readonly int FoamScale = Shader.PropertyToID("_FoamScale");
-            public static readonly int FoamAmount = Shader.PropertyToID("_FoamAmount");
-            public static readonly int BubbleAmount = Shader.PropertyToID("_BubbleAmount");
             public static readonly int FlowSpeedMin = Shader.PropertyToID("_FlowSpeedMin");
             public static readonly int FlowSpeedRange = Shader.PropertyToID("_FlowSpeedRange");
             public static readonly int FlowSheen = Shader.PropertyToID("_FlowSheen");
+            public static readonly int WhitewaterPositions = Shader.PropertyToID("_WhitewaterPositions");
+            public static readonly int WhitewaterVelocities = Shader.PropertyToID("_WhitewaterVelocities");
+            public static readonly int WhitewaterRadius = Shader.PropertyToID("_WhitewaterRadius");
+            public static readonly int WhitewaterMinPixels = Shader.PropertyToID("_WhitewaterMinPixels");
+            public static readonly int SprayIntensity = Shader.PropertyToID("_SprayIntensity");
+            public static readonly int FoamIntensity = Shader.PropertyToID("_FoamIntensity");
+            public static readonly int BubbleIntensity = Shader.PropertyToID("_BubbleIntensity");
+            public static readonly int BubbleAttenuation = Shader.PropertyToID("_BubbleAttenuation");
         }
     }
 }

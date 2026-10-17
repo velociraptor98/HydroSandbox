@@ -1,9 +1,10 @@
 // Screen-space fluid rendering (van der Laan et al. 2009 style), driven by FluidSurfaceFeature:
 //   0 ParticleDepth      sphere impostors -> nearest linear eye depth
-//   1 ParticleThickness  additive chord length (R), near-surface aeration (G), all aeration (B),
-//                        speed-weighted chord (A)
+//   1 ParticleThickness  additive chord length (R) and speed-weighted chord (G)
 //   2 BlurDepth          separable bilateral filter on eye depth, run once per axis
-//   3 Composite          normals from depth, refraction, Fresnel reflection, absorption, foam
+//   3 Composite          normals from depth, refraction, Fresnel reflection, absorption
+//   4 WhitewaterSplat    soft splats of spray/foam/bubble particles: visible (R), submerged (G)
+//   5 WhitewaterComposite  lights the accumulated whitewater and blends it over the water
 Shader "HydroSandbox/FluidSurface"
 {
     SubShader
@@ -24,7 +25,6 @@ Shader "HydroSandbox/FluidSurface"
         float _ParticleRadius;
         float _DepthRadiusScale;
         float _ThicknessScale;
-        float _FoamDepthFalloff;
 
         TEXTURE2D(_SceneDepth);
         TEXTURE2D(_SceneColor);
@@ -43,6 +43,18 @@ Shader "HydroSandbox/FluidSurface"
             return ComputeWorldSpacePosition(uv, deviceDepth, UNITY_MATRIX_I_VP);
         }
 
+        // Scene ambient probe evaluated on the CPU: SampleSH reads per-object probe data, which a
+        // full-screen procedural draw does not have.
+        float4 _AmbientUp;
+        float4 _AmbientHorizon;
+        float4 _AmbientDown;
+
+        float3 SampleAmbient(float3 n)
+        {
+            return n.y >= 0.0 ? lerp(_AmbientHorizon.rgb, _AmbientUp.rgb, n.y)
+                              : lerp(_AmbientHorizon.rgb, _AmbientDown.rgb, -n.y);
+        }
+
         // ---- Particle impostors -------------------------------------------------------------
 
         static const float2 kCorners[6] =
@@ -57,8 +69,7 @@ Shader "HydroSandbox/FluidSurface"
             float2 corner : TEXCOORD0;
             float3 centerVS : TEXCOORD1;
             float radius : TEXCOORD2;
-            float aeration : TEXCOORD3;
-            float speed : TEXCOORD4;
+            float speed : TEXCOORD3;
         };
 
         ParticleVaryings ParticleVert(uint vertexId, uint instanceId, float radiusScale)
@@ -72,9 +83,7 @@ Shader "HydroSandbox/FluidSurface"
             o.corner = corner;
             o.centerVS = centerVS;
             o.radius = radius;
-            float4 velocity = _Velocities[instanceId];
-            o.aeration = velocity.w;
-            o.speed = length(velocity.xyz);
+            o.speed = length(_Velocities[instanceId].xyz);
             // Dead pool slots (w = 0) collapse to a degenerate quad outside the clip volume.
             if (particle.w < 0.5)
                 o.positionCS = float4(2, 2, 2, 1);
@@ -138,7 +147,7 @@ Shader "HydroSandbox/FluidSurface"
                 return ParticleVert(vertexId, instanceId, 1.0);
             }
 
-            float4 Frag(ParticleVaryings i) : SV_Target
+            float2 Frag(ParticleVaryings i) : SV_Target
             {
                 float r2 = dot(i.corner, i.corner);
                 clip(1.0 - r2);
@@ -148,11 +157,7 @@ Shader "HydroSandbox/FluidSurface"
                 float2 uv = GetNormalizedScreenSpaceUV(i.positionCS);
                 clip(SceneEyeDepth(uv) - frontEyeDepth);
                 float chord = 2.0 * z * i.radius * _ThicknessScale;
-                // Foam is what floats at the visible surface, so aeration only counts within a
-                // few particle radii of the front depth.
-                float frontSurface = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r;
-                float surfaceWeight = exp(-max(frontEyeDepth - frontSurface, 0.0) / _FoamDepthFalloff);
-                return float4(chord, chord * i.aeration * surfaceWeight, chord * i.aeration, chord * i.speed);
+                return float2(chord, chord * i.speed);
             }
             ENDHLSL
         }
@@ -229,33 +234,16 @@ Shader "HydroSandbox/FluidSurface"
             #pragma fragment Frag
 
             TEXTURE2D(_RippleNormal);
-            TEXTURE2D(_FoamMask);
-            TEXTURE2D(_FoamColor);
 
             float4 _AbsorptionCoefficients; // per meter, rgb
             float4 _ScatterColor;
-            float4 _FoamTint;
             float _RefractionStrength;
             float _RippleStrength;
             float _RippleScale;
             float _RippleSpeed;
-            float _FoamScale;
-            float _FoamAmount;
-            float _BubbleAmount;
             float _FlowSpeedMin;
             float _FlowSpeedRange;
             float _FlowSheen;
-            // Scene ambient probe evaluated on the CPU: SampleSH reads per-object probe data,
-            // which a full-screen procedural draw does not have.
-            float4 _AmbientUp;
-            float4 _AmbientHorizon;
-            float4 _AmbientDown;
-
-            float3 SampleAmbient(float3 n)
-            {
-                return n.y >= 0.0 ? lerp(_AmbientHorizon.rgb, _AmbientUp.rgb, n.y)
-                                  : lerp(_AmbientHorizon.rgb, _AmbientDown.rgb, -n.y);
-            }
             float _EdgeOpacity;
             float _Smoothness;
 
@@ -286,13 +274,6 @@ Shader "HydroSandbox/FluidSurface"
                 return dot(n, toCamera) < 0 ? -n : n;
             }
 
-            float3 Triplanar(TEXTURE2D_PARAM(tex, samp), float3 p, float3 weights)
-            {
-                return SAMPLE_TEXTURE2D(tex, samp, p.zy).rgb * weights.x
-                     + SAMPLE_TEXTURE2D(tex, samp, p.xz).rgb * weights.y
-                     + SAMPLE_TEXTURE2D(tex, samp, p.xy).rgb * weights.z;
-            }
-
             // Two scrolling ripple layers per projection plane, added as a slope perturbation.
             float3 ApplyRipples(float3 n, float3 positionWS, float strength)
             {
@@ -321,13 +302,11 @@ Shader "HydroSandbox/FluidSurface"
                 if (eyeDepth >= NO_FLUID_DEPTH || eyeDepth > SceneEyeDepth(uv))
                     discard;
 
-                float4 thicknessFoam = SAMPLE_TEXTURE2D_LOD(_FluidThickness, sampler_LinearClamp, uv, 0);
-                float thickness = thicknessFoam.r;
-                float surfaceAeration = thicknessFoam.g;
-                float bubbles = 1.0 - exp(-thicknessFoam.b * _BubbleAmount);
+                float2 thicknessSpeed = SAMPLE_TEXTURE2D_LOD(_FluidThickness, sampler_LinearClamp, uv, 0).rg;
+                float thickness = thicknessSpeed.r;
                 // Fast water (the falling stream, the plunge) has a broken, roughened surface:
                 // stronger ripples and a silvery sheen, which is what makes a clear stream visible.
-                float meanSpeed = thicknessFoam.a / max(thickness, 1e-4);
+                float meanSpeed = thicknessSpeed.g / max(thickness, 1e-4);
                 float flow = saturate((meanSpeed - _FlowSpeedMin) / _FlowSpeedRange);
 
                 float3 positionWS = WorldPositionFromEyeDepth(uv, eyeDepth);
@@ -348,9 +327,7 @@ Shader "HydroSandbox/FluidSurface"
                 float3 transmittance = exp(-_AbsorptionCoefficients.rgb * thickness);
                 float3 ambient = SampleAmbient(n);
                 float3 transmitted = background * transmittance + _ScatterColor.rgb * ambient * (1.0 - transmittance);
-                // Bubbles scatter light white and hide what is behind them.
-                transmitted = lerp(transmitted, _FoamTint.rgb * ambient * 0.9, bubbles);
-                transmitted = lerp(transmitted, _FoamTint.rgb * ambient, flow * _FlowSheen);
+                transmitted = lerp(transmitted, ambient, flow * _FlowSheen);
 
                 float3 r = reflect(-v, n);
                 float mip = PerceptualRoughnessToMipmapLevel(1.0 - _Smoothness);
@@ -369,25 +346,134 @@ Shader "HydroSandbox/FluidSurface"
                 float ggx = a2 / (PI * denom * denom);
                 color += mainLight.color * ggx * fresnel * saturate(dot(n, mainLight.direction));
 
-                // Foam: aeration thresholds a photographed sea-foam lace, so light aeration shows
-                // as sparse streaks and heavy aeration as solid whitewater.
-                float3 w = pow(abs(geometricNormal), 4.0);
-                w /= dot(w, 1.0);
-                float3 foamP = positionWS * _FoamScale + float3(0, _Time.y * 0.03, 0);
-                float lace = Triplanar(TEXTURE2D_ARGS(_FoamMask, sampler_LinearRepeat), foamP, w).r;
-                // The foam photo only modulates brightness: its dark holes would read as dirt where
-                // coverage is full.
-                float foamVariation = Luminance(Triplanar(TEXTURE2D_ARGS(_FoamColor, sampler_LinearRepeat), foamP, w));
-                float3 foamAlbedo = _FoamTint.rgb * lerp(0.8, 1.0, saturate(foamVariation));
-                float foamCoverage = saturate(surfaceAeration * _FoamAmount);
-                float foam = saturate((lace - (1.0 - foamCoverage)) * 3.0 + foamCoverage * foamCoverage);
-                // Foam scatters light many times, so it stays bright in shade: boosted ambient and
-                // wrapped diffuse instead of a hard N.L.
-                float foamWrap = saturate(dot(geometricNormal, mainLight.direction) * 0.6 + 0.4);
-                float3 foamLit = foamAlbedo * (ambient * 1.5 + mainLight.color * foamWrap);
-                color = lerp(color, foamLit, foam);
+                float alpha = saturate(thickness * _EdgeOpacity);
+                return float4(color, alpha);
+            }
+            ENDHLSL
+        }
 
-                float alpha = saturate(thickness * _EdgeOpacity + foam + bubbles);
+        Pass
+        {
+            Name "WhitewaterSplat"
+            ZTest Always
+            Blend One One
+
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment Frag
+
+            #define TYPE_FOAM 1
+            #define TYPE_BUBBLE 2
+
+            StructuredBuffer<float4> _WhitewaterPositions;
+            StructuredBuffer<float4> _WhitewaterVelocities;
+            TEXTURE2D(_FoamMask);
+            float _WhitewaterRadius;
+            float _WhitewaterMinPixels;
+            float _SprayIntensity;
+            float _FoamIntensity;
+            float _BubbleIntensity;
+            float _BubbleAttenuation;
+            float _FoamScale;
+
+            struct SplatVaryings
+            {
+                float4 positionCS : SV_POSITION;
+                float2 corner : TEXCOORD0;
+                float eyeDepth : TEXCOORD1;
+                float intensity : TEXCOORD2;
+                float isFoam : TEXCOORD3;
+                float3 positionWS : TEXCOORD4;
+            };
+
+            SplatVaryings Vert(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
+            {
+                SplatVaryings o;
+                float4 particle = _WhitewaterPositions[instanceId];
+                uint type = (uint)_WhitewaterVelocities[instanceId].w;
+                float3 centerVS = TransformWorldToView(particle.xyz);
+                float eyeDepth = -centerVS.z;
+
+                // Keep splats at least _WhitewaterMinPixels wide and dim them by the area they
+                // grew by, so distant whitewater thins out instead of aliasing to nothing.
+                float pixelsPerMeter = abs(UNITY_MATRIX_P._m11) * 0.5 * _ScaledScreenParams.y / max(eyeDepth, 1e-3);
+                float radius = _WhitewaterRadius;
+                float pixelRadius = radius * pixelsPerMeter;
+                float grow = max(_WhitewaterMinPixels / max(pixelRadius, 1e-4), 1.0);
+                radius *= grow;
+
+                float intensity = type == TYPE_BUBBLE ? _BubbleIntensity : (type == TYPE_FOAM ? _FoamIntensity : _SprayIntensity);
+                intensity *= saturate(particle.w / 0.5) / (grow * grow);
+
+                float2 corner = kCorners[vertexId];
+                o.positionCS = TransformWViewToHClip(centerVS + float3(corner * radius, 0));
+                o.corner = corner;
+                o.eyeDepth = eyeDepth;
+                o.intensity = intensity;
+                o.isFoam = type == TYPE_FOAM ? 1.0 : 0.0;
+                o.positionWS = particle.xyz;
+                if (particle.w <= 0.0 || eyeDepth <= 0.0)
+                    o.positionCS = float4(2, 2, 2, 1);
+                return o;
+            }
+
+            float2 Frag(SplatVaryings i) : SV_Target
+            {
+                float r2 = dot(i.corner, i.corner);
+                clip(1.0 - r2);
+                float2 uv = GetNormalizedScreenSpaceUV(i.positionCS);
+                clip(SceneEyeDepth(uv) - i.eyeDepth);
+
+                float value = i.intensity * exp(-4.0 * r2);
+                // Surface foam gathers into lace: the photographed foam pattern, fixed in world
+                // space, breaks clusters of foam particles into strands and holes.
+                if (i.isFoam > 0.5)
+                {
+                    float lace = SAMPLE_TEXTURE2D_LOD(_FoamMask, sampler_LinearRepeat, i.positionWS.xz * _FoamScale, 0).r;
+                    value *= lerp(0.25, 1.6, lace);
+                }
+
+                // Splats more than a particle radius behind the water's front surface are seen
+                // through it (submerged bubbles), attenuated by the water in front.
+                float frontDepth = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r;
+                float submerged = i.eyeDepth - frontDepth;
+                if (frontDepth < NO_FLUID_DEPTH && submerged > _WhitewaterRadius * 3.0)
+                    return float2(0, value * exp(-submerged * _BubbleAttenuation));
+                return float2(value, 0);
+            }
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "WhitewaterComposite"
+            ZTest Always
+            Blend SrcAlpha OneMinusSrcAlpha
+
+            HLSLPROGRAM
+            #pragma vertex FullscreenVert
+            #pragma fragment Frag
+
+            TEXTURE2D(_Whitewater);
+            float4 _FoamTint;
+            float4 _ScatterColor;
+
+            float4 Frag(FullscreenVaryings i) : SV_Target
+            {
+                float2 uv = GetNormalizedScreenSpaceUV(i.positionCS);
+                float2 density = SAMPLE_TEXTURE2D_LOD(_Whitewater, sampler_PointClamp, uv, 0).rg;
+                float visible = 1.0 - exp(-density.r);
+                float submerged = (1.0 - exp(-density.g)) * 0.8;
+                float alpha = 1.0 - (1.0 - visible) * (1.0 - submerged);
+                if (alpha < 1e-3)
+                    discard;
+
+                // Whitewater scatters light many times, so it stays bright in shade: boosted sky
+                // ambient plus a wrapped share of the sun rather than a hard N.L.
+                Light mainLight = GetMainLight();
+                float3 lit = _FoamTint.rgb * (SampleAmbient(float3(0, 1, 0)) * 1.6 + mainLight.color * 0.7);
+                float3 bubbleLit = lit * lerp(float3(1, 1, 1), _ScatterColor.rgb * 3.0, 0.4);
+                float3 color = (lit * visible + bubbleLit * submerged * (1.0 - visible)) / alpha;
                 return float4(color, alpha);
             }
             ENDHLSL

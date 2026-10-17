@@ -280,6 +280,7 @@ GameObject:
   - component: {fileID: 689102335}
   - component: {fileID: 689102336}
   - component: {fileID: 689102337}
+  - component: {fileID: 689102338}
   m_Layer: 0
   m_Name: Fluid
   m_TagString: Untagged
@@ -329,11 +330,6 @@ MonoBehaviour:
     viscosity: 0.05
     gravity: {x: 0, y: -9.81, z: 0}
     cohesion: 0
-    aerationImpactMin: 1
-    aerationImpactRange: 1
-    aerationDecay: 0.35
-    aerationDiffusion: 0.25
-    aerationBuoyancy: 1.6
     timeStep: 0.016666668
     smoothingRadiusScale: 4
     constraintRelaxation: 0.5
@@ -411,6 +407,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: HydroSandbox.Runtime::HydroSandbox.FluidSurface
   solver: {fileID: 689102333}
+  whitewater: {fileID: 689102338}
   surfaceShader: {fileID: 4800000, guid: 8deca0bd57ef64f19a2650158e80fb72, type: 3}
   depthRadiusScale: 1.3
   thicknessScale: 1.9
@@ -430,13 +427,43 @@ MonoBehaviour:
   flowSpeedMin: 0.8
   flowSpeedRange: 2
   flowSheen: 0.35
+  whitewaterRadius: 0.4
+  whitewaterMinPixels: 1.2
+  sprayIntensity: 0.5
+  foamIntensity: 0.45
+  bubbleIntensity: 0.3
+  bubbleAttenuation: 6
   foamMask: {fileID: 2800000, guid: fb4204e4b114049bba728aa1594f075e, type: 3}
-  foamColor: {fileID: 2800000, guid: 2310b392a788543889305e1e2b78a158, type: 3}
-  foamTint: {r: 0.95, g: 0.97, b: 1, a: 1}
   foamScale: 3
-  foamAmount: 40
-  bubbleAmount: 12
-  foamDepth: 3
+  foamTint: {r: 0.95, g: 0.97, b: 1, a: 1}
+--- !u!114 &689102338
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 689102331}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6e0abd8b117104897a1438a78bf07a68, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: HydroSandbox.Runtime::HydroSandbox.FluidWhitewater
+  whitewaterShader: {fileID: 7200000, guid: 1950bbe63c17a4fc2906c823b477808f, type: 3}
+  capacity: 262144
+  trappedAirRate: 600
+  trappedAirRange: {x: 2, y: 15}
+  waveCrestRate: 300
+  waveCrestRange: {x: 0.5, y: 4}
+  energyRange: {x: 0.5, y: 5}
+  maxEmitPerParticle: 8
+  emitSpread: 0.3
+  surfaceThreshold: 0.35
+  lifetimeRange: {x: 1.5, y: 4}
+  sprayDrag: 0.5
+  bubbleBuoyancy: 2
+  bubbleDrag: 0.3
+  sprayMaxNeighbors: 6
+  bubbleMinNeighbors: 20
 --- !u!1 &697819427
 GameObject:
   m_ObjectHideFlags: 0
