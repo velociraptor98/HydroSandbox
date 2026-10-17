@@ -245,6 +245,17 @@ Shader "HydroSandbox/FluidSurface"
             float _FlowSpeedMin;
             float _FlowSpeedRange;
             float _FlowSheen;
+            // Scene ambient probe evaluated on the CPU: SampleSH reads per-object probe data,
+            // which a full-screen procedural draw does not have.
+            float4 _AmbientUp;
+            float4 _AmbientHorizon;
+            float4 _AmbientDown;
+
+            float3 SampleAmbient(float3 n)
+            {
+                return n.y >= 0.0 ? lerp(_AmbientHorizon.rgb, _AmbientUp.rgb, n.y)
+                                  : lerp(_AmbientHorizon.rgb, _AmbientDown.rgb, -n.y);
+            }
             float _EdgeOpacity;
             float _Smoothness;
 
@@ -335,7 +346,7 @@ Shader "HydroSandbox/FluidSurface"
 
                 // Beer-Lambert absorption plus in-scattered ambient light along the same path.
                 float3 transmittance = exp(-_AbsorptionCoefficients.rgb * thickness);
-                float3 ambient = SampleSH(n);
+                float3 ambient = SampleAmbient(n);
                 float3 transmitted = background * transmittance + _ScatterColor.rgb * ambient * (1.0 - transmittance);
                 // Bubbles scatter light white and hide what is behind them.
                 transmitted = lerp(transmitted, _FoamTint.rgb * ambient * 0.9, bubbles);
@@ -364,10 +375,16 @@ Shader "HydroSandbox/FluidSurface"
                 w /= dot(w, 1.0);
                 float3 foamP = positionWS * _FoamScale + float3(0, _Time.y * 0.03, 0);
                 float lace = Triplanar(TEXTURE2D_ARGS(_FoamMask, sampler_LinearRepeat), foamP, w).r;
-                float3 foamAlbedo = Triplanar(TEXTURE2D_ARGS(_FoamColor, sampler_LinearRepeat), foamP, w) * _FoamTint.rgb;
+                // The foam photo only modulates brightness: its dark holes would read as dirt where
+                // coverage is full.
+                float foamVariation = Luminance(Triplanar(TEXTURE2D_ARGS(_FoamColor, sampler_LinearRepeat), foamP, w));
+                float3 foamAlbedo = _FoamTint.rgb * lerp(0.8, 1.0, saturate(foamVariation));
                 float foamCoverage = saturate(surfaceAeration * _FoamAmount);
                 float foam = saturate((lace - (1.0 - foamCoverage)) * 3.0 + foamCoverage * foamCoverage);
-                float3 foamLit = foamAlbedo * (ambient + mainLight.color * saturate(dot(geometricNormal, mainLight.direction)));
+                // Foam scatters light many times, so it stays bright in shade: boosted ambient and
+                // wrapped diffuse instead of a hard N.L.
+                float foamWrap = saturate(dot(geometricNormal, mainLight.direction) * 0.6 + 0.4);
+                float3 foamLit = foamAlbedo * (ambient * 1.5 + mainLight.color * foamWrap);
                 color = lerp(color, foamLit, foam);
 
                 float alpha = saturate(thickness * _EdgeOpacity + foam + bubbles);

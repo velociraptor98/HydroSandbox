@@ -279,6 +279,7 @@ GameObject:
   - component: {fileID: 689102334}
   - component: {fileID: 689102335}
   - component: {fileID: 689102336}
+  - component: {fileID: 689102337}
   m_Layer: 0
   m_Name: Fluid
   m_TagString: Untagged
@@ -327,6 +328,12 @@ MonoBehaviour:
     restDensity: 1000
     viscosity: 0.05
     gravity: {x: 0, y: -9.81, z: 0}
+    cohesion: 0
+    aerationImpactMin: 1
+    aerationImpactRange: 1
+    aerationDecay: 0.35
+    aerationDiffusion: 0.25
+    aerationBuoyancy: 1.6
     timeStep: 0.016666668
     smoothingRadiusScale: 4
     constraintRelaxation: 0.5
@@ -371,6 +378,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: HydroSandbox.Runtime::HydroSandbox.FluidDebugPanel
   solver: {fileID: 689102333}
   visible: 1
+  sphereRenderer: {fileID: 689102334}
+  waterSurface: {fileID: 689102337}
+  viewMode: 0
 --- !u!114 &689102336
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -388,6 +398,45 @@ MonoBehaviour:
   particleCounts: 008000000000010000000200008002000000030000800300000004000000060000000800i
   warmupFrames: 60
   sampleFrames: 300
+--- !u!114 &689102337
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 689102331}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 790e84584ca09453d951d33e28d68790, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: HydroSandbox.Runtime::HydroSandbox.FluidSurface
+  solver: {fileID: 689102333}
+  surfaceShader: {fileID: 4800000, guid: 8deca0bd57ef64f19a2650158e80fb72, type: 3}
+  depthRadiusScale: 1.3
+  thicknessScale: 1.9
+  blurRadius: 6
+  blurIterations: 2
+  blurDepthFalloff: 2.5
+  blurMaxPixels: 24
+  absorption: {x: 1.6, y: 0.32, z: 0.22}
+  scatterColor: {r: 0.06, g: 0.22, b: 0.24, a: 1}
+  refractionStrength: 0.035
+  smoothness: 0.95
+  edgeOpacity: 60
+  rippleNormal: {fileID: 2800000, guid: 70208cc22caf44efa9833764448bcddb, type: 3}
+  rippleStrength: 0.35
+  rippleScale: 1.6
+  rippleSpeed: 0.04
+  flowSpeedMin: 0.8
+  flowSpeedRange: 2
+  flowSheen: 0.35
+  foamMask: {fileID: 2800000, guid: fb4204e4b114049bba728aa1594f075e, type: 3}
+  foamColor: {fileID: 2800000, guid: 2310b392a788543889305e1e2b78a158, type: 3}
+  foamTint: {r: 0.95, g: 0.97, b: 1, a: 1}
+  foamScale: 3
+  foamAmount: 40
+  bubbleAmount: 12
+  foamDepth: 3
 --- !u!1 &697819427
 GameObject:
   m_ObjectHideFlags: 0

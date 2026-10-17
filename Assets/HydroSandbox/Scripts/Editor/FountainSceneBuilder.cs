@@ -175,6 +175,9 @@ namespace HydroSandbox.Editor
             var panelSo = new SerializedObject(panel);
             panelSo.FindProperty("solver").objectReferenceValue = solver;
             panelSo.FindProperty("visible").boolValue = false;
+            panelSo.FindProperty("sphereRenderer").objectReferenceValue = debugRenderer;
+            panelSo.FindProperty("waterSurface").objectReferenceValue = surface;
+            panelSo.FindProperty("viewMode").enumValueIndex = (int)FluidViewMode.Water;
             panelSo.ApplyModifiedPropertiesWithoutUndo();
 
             // Pitched 10 degrees down, pointing out of the wall (-Z).

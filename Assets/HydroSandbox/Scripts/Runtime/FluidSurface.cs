@@ -63,6 +63,8 @@ namespace HydroSandbox
         [SerializeField, Range(0.5f, 10f)] float foamDepth = 3f;
 
         Material material;
+        static readonly Vector3[] AmbientDirections = { Vector3.up, Vector3.right, Vector3.down };
+        readonly Color[] ambientColors = new Color[3];
 
         public FluidSolver Solver => solver;
         public int BlurIterations => blurIterations;
@@ -108,6 +110,10 @@ namespace HydroSandbox
 
         public void SetCompositeProperties(MaterialPropertyBlock properties)
         {
+            RenderSettings.ambientProbe.Evaluate(AmbientDirections, ambientColors);
+            properties.SetColor(Ids.AmbientUp, ambientColors[0] * RenderSettings.ambientIntensity);
+            properties.SetColor(Ids.AmbientHorizon, ambientColors[1] * RenderSettings.ambientIntensity);
+            properties.SetColor(Ids.AmbientDown, ambientColors[2] * RenderSettings.ambientIntensity);
             properties.SetVector(Ids.AbsorptionCoefficients, absorption);
             properties.SetColor(Ids.ScatterColor, scatterColor);
             properties.SetFloat(Ids.RefractionStrength, refractionStrength);
@@ -140,6 +146,9 @@ namespace HydroSandbox
             public static readonly int BlurDepthFalloff = Shader.PropertyToID("_BlurDepthFalloff");
             public static readonly int BlurMaxRadius = Shader.PropertyToID("_BlurMaxRadius");
             public static readonly int AbsorptionCoefficients = Shader.PropertyToID("_AbsorptionCoefficients");
+            public static readonly int AmbientUp = Shader.PropertyToID("_AmbientUp");
+            public static readonly int AmbientHorizon = Shader.PropertyToID("_AmbientHorizon");
+            public static readonly int AmbientDown = Shader.PropertyToID("_AmbientDown");
             public static readonly int ScatterColor = Shader.PropertyToID("_ScatterColor");
             public static readonly int RefractionStrength = Shader.PropertyToID("_RefractionStrength");
             public static readonly int Smoothness = Shader.PropertyToID("_Smoothness");

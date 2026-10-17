@@ -2,17 +2,54 @@ using UnityEngine;
 
 namespace HydroSandbox
 {
-    /// <summary>On-screen tuning and timing panel for the solver. F1 toggles it.</summary>
+    public enum FluidViewMode
+    {
+        Spheres,
+        Water,
+    }
+
+    /// <summary>
+    /// On-screen tuning and timing panel for the solver. F1 toggles the panel, F2 switches between
+    /// the debug spheres and the screen-space water surface.
+    /// </summary>
     public class FluidDebugPanel : MonoBehaviour
     {
         static readonly int[] CountPresets = { 32768, 65536, 131072, 262144, 524288 };
+        static readonly string[] ViewModeLabels = { "Spheres", "Water" };
 
         [SerializeField] FluidSolver solver;
         [SerializeField] bool visible = true;
 
+        [Header("View")]
+        [SerializeField] FluidDebugRenderer sphereRenderer;
+        [SerializeField] FluidSurface waterSurface;
+        [SerializeField] FluidViewMode viewMode = FluidViewMode.Spheres;
+
         readonly FrameTiming[] frameTimings = new FrameTiming[1];
         float smoothedFrameMs = 16.7f;
         double gpuFrameMs;
+
+        bool CanSwitchView => sphereRenderer != null && waterSurface != null;
+
+        public FluidViewMode ViewMode
+        {
+            get => viewMode;
+            set
+            {
+                viewMode = value;
+                ApplyViewMode();
+            }
+        }
+
+        void Start() => ApplyViewMode();
+
+        void ApplyViewMode()
+        {
+            if (!CanSwitchView)
+                return;
+            sphereRenderer.enabled = viewMode == FluidViewMode.Spheres;
+            waterSurface.enabled = viewMode == FluidViewMode.Water;
+        }
 
         void Update()
         {
@@ -30,6 +67,11 @@ namespace HydroSandbox
                 visible = !visible;
                 e.Use();
             }
+            if (e.type == EventType.KeyDown && e.keyCode == KeyCode.F2 && CanSwitchView)
+            {
+                ViewMode = viewMode == FluidViewMode.Spheres ? FluidViewMode.Water : FluidViewMode.Spheres;
+                e.Use();
+            }
             if (!visible || solver == null)
                 return;
 
@@ -42,6 +84,13 @@ namespace HydroSandbox
             string frameGpuMs = gpuFrameMs > 0 ? $"{gpuFrameMs:F2} ms" : "n/a";
             GUILayout.Label($"GPU frame {frameGpuMs}   solver {solverMs}");
             GUILayout.Label($"Particles {solver.AliveCount:N0} / {solver.Capacity:N0}");
+
+            if (CanSwitchView)
+            {
+                var selected = (FluidViewMode)GUILayout.Toolbar((int)viewMode, ViewModeLabels);
+                if (selected != viewMode)
+                    ViewMode = selected;
+            }
 
             GUILayout.BeginHorizontal();
             foreach (int count in CountPresets)
