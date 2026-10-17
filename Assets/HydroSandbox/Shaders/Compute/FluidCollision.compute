@@ -1,11 +1,111 @@
+// Collision response, run inside the solver loop (and once after prediction, before the
+// neighbor search). Each kernel projects predicted positions out of one kind of obstacle and
+// applies Coulomb-like friction to the tangential displacement relative to the obstacle surface.
+// All of them run over the whole pool because the pre-sort pass happens before live particles
+// are contiguous.
+
 #pragma kernel ResolveContainer
+#pragma kernel ResolveColliders
+#pragma kernel ResolveTerrain
 
 #include "FluidCommon.hlsl"
 
-RWStructuredBuffer<float4> _Predicted;
+#define SHAPE_BOX 0
+#define SHAPE_SPHERE 1
+#define SHAPE_CAPSULE 2
 
-// _ContainerMin/_ContainerMax are already inset by the particle radius. Runs over the whole pool
-// because it is also dispatched before the sort, when live particles are not yet contiguous.
+struct ColliderRecord
+{
+    float3 center;
+    uint shape;
+    float4 rotation;        // world rotation quaternion (x, y, z, w)
+    float3 extents;         // box half extents; capsule: (0, half segment length, 0)
+    float radius;           // sphere and capsule radius
+    float3 linearVelocity;
+    uint padding;
+    float3 angularVelocity;
+    float friction;
+};
+
+RWStructuredBuffer<float4> _Predicted;
+StructuredBuffer<float4> _Positions;
+
+uint _ColliderCount;
+StructuredBuffer<ColliderRecord> _Colliders;
+float _ParticleRadius;
+
+// Heights normalized to [0, 1], row-major by z: index = z * resolution + x.
+StructuredBuffer<float> _TerrainHeights;
+float3 _TerrainOrigin;
+float3 _TerrainSize;
+uint _TerrainResolution;
+float _TerrainFriction;
+
+float3 RotateVector(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+float3 InverseRotateVector(float4 q, float3 v)
+{
+    return RotateVector(float4(-q.xyz, q.w), v);
+}
+
+// Signed distance and outward normal, in the collider's local frame.
+float ShapeDistance(ColliderRecord c, float3 p, out float3 normal)
+{
+    normal = float3(0, 1, 0);
+    float distance;
+    if (c.shape == SHAPE_SPHERE)
+    {
+        float len = length(p);
+        if (len > 1e-6)
+            normal = p / len;
+        distance = len - c.radius;
+    }
+    else if (c.shape == SHAPE_CAPSULE)
+    {
+        float3 v = p - float3(0, clamp(p.y, -c.extents.y, c.extents.y), 0);
+        float len = length(v);
+        normal = len > 1e-6 ? v / len : float3(1, 0, 0);
+        distance = len - c.radius;
+    }
+    else
+    {
+        float3 q = abs(p) - c.extents;
+        float3 outside = max(q, 0);
+        float outsideLen = length(outside);
+        if (outsideLen > 0)
+        {
+            normal = outside / outsideLen * sign(p);
+            distance = outsideLen;
+        }
+        else
+        {
+            // Inside: leave through the nearest face.
+            if (q.x >= q.y && q.x >= q.z)
+                normal = float3(sign(p.x), 0, 0);
+            else if (q.y >= q.z)
+                normal = float3(0, sign(p.y), 0);
+            else
+                normal = float3(0, 0, sign(p.z));
+            distance = max(q.x, max(q.y, q.z));
+        }
+    }
+    return distance;
+}
+
+// Pushes p out to the particle radius along `normal` and removes `friction` of its tangential
+// displacement relative to a surface moving at surfaceVelocity. Returns the correction.
+float3 Contact(float3 p, float3 previous, float3 normal, float distance, float3 surfaceVelocity, float friction)
+{
+    float3 correction = normal * (_ParticleRadius - distance);
+    float3 slip = (p + correction) - previous - surfaceVelocity * _DeltaTime;
+    float3 tangential = slip - dot(slip, normal) * normal;
+    return correction - tangential * friction;
+}
+
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void ResolveContainer(uint3 id : SV_DispatchThreadID)
 {
@@ -16,5 +116,84 @@ void ResolveContainer(uint3 id : SV_DispatchThreadID)
     if (!IsAlive(p))
         return;
 
+    // _ContainerMin/_ContainerMax are already inset by the particle radius.
     _Predicted[i] = float4(clamp(p.xyz, _ContainerMin, _ContainerMax), p.w);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ResolveColliders(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+    float4 p4 = _Predicted[i];
+    if (!IsAlive(p4))
+        return;
+
+    float3 p = p4.xyz;
+    float3 previous = _Positions[i].xyz;
+    bool moved = false;
+    for (uint k = 0; k < _ColliderCount; k++)
+    {
+        ColliderRecord c = _Colliders[k];
+        float3 localNormal;
+        float distance = ShapeDistance(c, InverseRotateVector(c.rotation, p - c.center), localNormal);
+        if (distance >= _ParticleRadius)
+            continue;
+
+        float3 normal = RotateVector(c.rotation, localNormal);
+        float3 contactPoint = p - normal * distance;
+        float3 surfaceVelocity = c.linearVelocity + cross(c.angularVelocity, contactPoint - c.center);
+        p += Contact(p, previous, normal, distance, surfaceVelocity, c.friction);
+        moved = true;
+    }
+    if (moved)
+        _Predicted[i] = float4(p, p4.w);
+}
+
+float TerrainHeight(float2 cell)
+{
+    uint res = _TerrainResolution;
+    cell = clamp(cell, 0, res - 1.001);
+    uint2 c0 = (uint2)cell;
+    float2 f = cell - c0;
+    float h00 = _TerrainHeights[c0.y * res + c0.x];
+    float h10 = _TerrainHeights[c0.y * res + c0.x + 1];
+    float h01 = _TerrainHeights[(c0.y + 1) * res + c0.x];
+    float h11 = _TerrainHeights[(c0.y + 1) * res + c0.x + 1];
+    return lerp(lerp(h00, h10, f.x), lerp(h01, h11, f.x), f.y) * _TerrainSize.y + _TerrainOrigin.y;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ResolveTerrain(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount || _TerrainResolution == 0)
+        return;
+    float4 p4 = _Predicted[i];
+    if (!IsAlive(p4))
+        return;
+
+    float3 p = p4.xyz;
+    float2 uv = (p.xz - _TerrainOrigin.xz) / _TerrainSize.xz;
+    if (any(uv < 0.0) || any(uv > 1.0))
+        return;
+
+    float2 cellSize = _TerrainSize.xz / (_TerrainResolution - 1);
+    float2 cell = uv * (_TerrainResolution - 1);
+    float h = TerrainHeight(cell);
+    // Cheap reject before the gradient: anything clearly above the surface plus a steep bank.
+    if (p.y - h > _ParticleRadius * 4.0)
+        return;
+
+    float dhdx = (TerrainHeight(cell + float2(1, 0)) - TerrainHeight(cell - float2(1, 0))) / (2.0 * cellSize.x);
+    float dhdz = (TerrainHeight(cell + float2(0, 1)) - TerrainHeight(cell - float2(0, 1))) / (2.0 * cellSize.y);
+    float3 normal = normalize(float3(-dhdx, 1.0, -dhdz));
+    // Distance to the local tangent plane of the heightfield.
+    float distance = (p.y - h) * normal.y;
+    if (distance >= _ParticleRadius)
+        return;
+
+    p += Contact(p, _Positions[i].xyz, normal, distance, 0, _TerrainFriction);
+    _Predicted[i] = float4(p, p4.w);
 }

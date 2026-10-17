@@ -1,7 +1,9 @@
 {
     "name": "HydroSandbox.Runtime",
     "rootNamespace": "HydroSandbox",
-    "references": [],
+    "references": [
+        "Unity.InputSystem"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

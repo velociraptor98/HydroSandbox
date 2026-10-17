@@ -18,6 +18,7 @@ namespace HydroSandbox
         const int ScanBlockSize = 1024;
         const int MaxNeighbors = 64;
         const int MaxSinks = 32;
+        const int MaxColliders = 64;
         const int MaxSpawnLayers = 256;
         const int MaxSpawnPoints = 16384;
         const int AliveReadbackInterval = 10;
@@ -60,9 +61,11 @@ namespace HydroSandbox
         GraphicsBuffer neighborList, neighborCount;
         GraphicsBuffer fluidState;
         GraphicsBuffer sinkRecords, sinkCounters, spawnLayers, spawnPattern;
+        GraphicsBuffer colliderRecords;
         readonly List<GraphicsBuffer> scanBlockSums = new List<GraphicsBuffer>();
         readonly List<GraphicsBuffer> scanBlockOffsets = new List<GraphicsBuffer>();
 
+        FluidRigidbodyCoupling coupling;
         int poolSize;
         int hashTableSize;
         int bufferGeneration;
@@ -71,6 +74,7 @@ namespace HydroSandbox
         readonly uint[] zeroCounters = new uint[MaxSinks];
         readonly List<SpawnLayer> layerList = new List<SpawnLayer>();
         readonly List<Vector2> patternList = new List<Vector2>();
+        readonly List<ColliderRecord> colliderList = new List<ColliderRecord>();
         int gridBitsX, gridBitsY, gridBitsZ;
 
         CommandBuffer cmd;
@@ -83,7 +87,7 @@ namespace HydroSandbox
         int neighborListKernel;
         int sinkKernel, spawnKernel;
         int lambdaKernel, deltaKernel, applyDeltaKernel;
-        int containerKernel;
+        int containerKernel, collidersKernel, terrainKernel;
         int updateVelocityKernel, viscosityKernel;
 
         float cachedMassSmoothing = -1f, cachedMassSpacing = -1f, cachedMass;
@@ -185,16 +189,20 @@ namespace HydroSandbox
                 return;
 
             int substeps = Mathf.Max(1, settings.substeps);
+            coupling = TryGetComponent(out FluidRigidbodyCoupling c) && c.isActiveAndEnabled ? c : null;
             cmd.Clear();
             cmd.BeginSample(solveSampler);
             PushParameters(settings.timeStep / substeps);
             RecordEmission(settings.timeStep);
+            RecordColliderSetup();
             for (int i = 0; i < substeps; i++)
                 RecordSubstep();
+            coupling?.Record(cmd, this);
             if (TryGetComponent(out FluidWhitewater whitewater) && whitewater.isActiveAndEnabled)
                 whitewater.Record(cmd, this, settings.timeStep, frameIndex);
             cmd.EndSample(solveSampler);
             Graphics.ExecuteCommandBuffer(cmd);
+            coupling?.RequestResults();
 
             if (++frameIndex % AliveReadbackInterval == 0)
                 RequestAliveCount();
@@ -224,6 +232,8 @@ namespace HydroSandbox
             deltaKernel = densityConstraintShader.FindKernel("ComputeDeltaPosition");
             applyDeltaKernel = densityConstraintShader.FindKernel("ApplyDeltaPosition");
             containerKernel = collisionShader.FindKernel("ResolveContainer");
+            collidersKernel = collisionShader.FindKernel("ResolveColliders");
+            terrainKernel = collisionShader.FindKernel("ResolveTerrain");
             updateVelocityKernel = velocityShader.FindKernel("UpdateVelocity");
             viscosityKernel = velocityShader.FindKernel("ApplyViscosity");
             sinkKernel = emissionShader.FindKernel("ApplySinks");
@@ -265,6 +275,7 @@ namespace HydroSandbox
             sinkCounters = CreateBuffer(MaxSinks, 4);
             spawnLayers = CreateBuffer(MaxSpawnLayers, Marshal.SizeOf<SpawnLayer>());
             spawnPattern = CreateBuffer(MaxSpawnPoints, 8);
+            colliderRecords = CreateBuffer(MaxColliders, Marshal.SizeOf<ColliderRecord>());
 
             int levelCount = hashTableSize + 1;
             do
@@ -286,13 +297,15 @@ namespace HydroSandbox
                          positions, positionsAlt, predicted, predictedAlt, velocities, velocitiesAlt,
                          fluidType, fluidTypeAlt, density, lambda, deltaPosition,
                          particleCell, sortedCellId, cellCount, cellStart, neighborList, neighborCount,
-                         fluidState, sinkRecords, sinkCounters, spawnLayers, spawnPattern
+                         fluidState, sinkRecords, sinkCounters, spawnLayers, spawnPattern,
+                         colliderRecords
                      })
                 buffer?.Release();
             positions = positionsAlt = predicted = predictedAlt = velocities = velocitiesAlt = null;
             fluidType = fluidTypeAlt = density = lambda = deltaPosition = null;
             particleCell = sortedCellId = cellCount = cellStart = neighborList = neighborCount = null;
             fluidState = sinkRecords = sinkCounters = spawnLayers = spawnPattern = null;
+            colliderRecords = null;
 
             foreach (var buffer in scanBlockSums)
                 buffer.Release();
@@ -306,6 +319,14 @@ namespace HydroSandbox
 
         void UploadInitialState()
         {
+            // enabled, not isActiveAndEnabled: during the solver's OnEnable the fill component may
+            // not have been enabled yet, and isActiveAndEnabled stays false until it has.
+            if (TryGetComponent(out FluidInitialFill fill) && fill.enabled)
+            {
+                UploadCustomInitialState(fill);
+                return;
+            }
+
             float r = settings.particleRadius;
             float spacing = settings.ParticleSpacing;
             Vector3 innerMin = container.min + Vector3.one * r;
@@ -339,6 +360,31 @@ namespace HydroSandbox
 
             System.Array.Clear(data, 0, data.Length);
             velocities.SetData(data);
+            fluidType.SetData(new uint[poolSize]);
+            fluidState.SetData(new uint[] { (uint)initial, 0, 0, 0 });
+            AliveCount = initial;
+        }
+
+        void UploadCustomInitialState(FluidInitialFill fill)
+        {
+            var points = new List<Vector3>();
+            var startVelocities = new List<Vector3>();
+            fill.Generate(settings.ParticleSpacing, points, startVelocities);
+            int initial = Mathf.Min(points.Count, poolSize);
+            if (points.Count > poolSize)
+                Debug.LogWarning($"FluidSolver: initial fill produced {points.Count} particles but capacity is {poolSize}; extra particles dropped.", this);
+
+            var data = new Vector4[poolSize];
+            var velocityData = new Vector4[poolSize];
+            for (int i = 0; i < initial; i++)
+            {
+                Vector3 p = points[i];
+                data[i] = new Vector4(p.x, p.y, p.z, 1f);
+                velocityData[i] = i < startVelocities.Count ? (Vector4)startVelocities[i] : Vector4.zero;
+            }
+            positions.SetData(data);
+            predicted.SetData(data);
+            velocities.SetData(velocityData);
             fluidType.SetData(new uint[poolSize]);
             fluidState.SetData(new uint[] { (uint)initial, 0, 0, 0 });
             AliveCount = initial;
@@ -411,6 +457,58 @@ namespace HydroSandbox
             cmd.SetComputeVectorParam(cs, Ids.ContainerMax, container.max - inset);
         }
 
+        /// <summary>Uploads this frame's collider records and terrain parameters.</summary>
+        void RecordColliderSetup()
+        {
+            colliderList.Clear();
+            foreach (var collider in FluidCollider.Active)
+            {
+                if (colliderList.Count >= MaxColliders)
+                    break;
+                colliderList.Add(collider.BuildRecord());
+            }
+
+            var cs = collisionShader;
+            cmd.SetComputeIntParam(cs, Ids.ColliderCount, colliderList.Count);
+            if (colliderList.Count > 0)
+                cmd.SetBufferData(colliderRecords, colliderList);
+            cmd.SetComputeFloatParam(cs, Ids.ParticleRadius, settings.particleRadius);
+
+            var terrain = FluidTerrainCollider.ActiveTerrain;
+            bool hasTerrain = terrain != null && terrain.HeightBuffer != null;
+            cmd.SetComputeIntParam(cs, Ids.TerrainResolution, hasTerrain ? terrain.Resolution : 0);
+            if (hasTerrain)
+            {
+                cmd.SetComputeVectorParam(cs, Ids.TerrainOrigin, terrain.Origin);
+                cmd.SetComputeVectorParam(cs, Ids.TerrainSize, terrain.Size);
+                cmd.SetComputeFloatParam(cs, Ids.TerrainFriction, terrain.Friction);
+            }
+        }
+
+        void RecordCollisions()
+        {
+            var cs = collisionShader;
+            cmd.SetComputeBufferParam(cs, containerKernel, Ids.Predicted, predicted);
+            DispatchParticles(cs, containerKernel);
+
+            var terrain = FluidTerrainCollider.ActiveTerrain;
+            if (terrain != null && terrain.HeightBuffer != null)
+            {
+                cmd.SetComputeBufferParam(cs, terrainKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(cs, terrainKernel, Ids.Positions, positions);
+                cmd.SetComputeBufferParam(cs, terrainKernel, Ids.TerrainHeights, terrain.HeightBuffer);
+                DispatchParticles(cs, terrainKernel);
+            }
+
+            if (colliderList.Count > 0)
+            {
+                cmd.SetComputeBufferParam(cs, collidersKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(cs, collidersKernel, Ids.Positions, positions);
+                cmd.SetComputeBufferParam(cs, collidersKernel, Ids.Colliders, colliderRecords);
+                DispatchParticles(cs, collidersKernel);
+            }
+        }
+
         void RecordEmission(float dt)
         {
             float spacing = settings.ParticleSpacing;
@@ -478,9 +576,8 @@ namespace HydroSandbox
             DispatchParticles(ps, predictKernel);
 
             // Also before the neighbor search: the neighbor list is fixed for the substep, so
-            // particles predicted outside the box must be pulled in before it is built.
-            cmd.SetComputeBufferParam(collisionShader, containerKernel, Ids.Predicted, predicted);
-            DispatchParticles(collisionShader, containerKernel);
+            // particles predicted inside obstacles must be pushed out before it is built.
+            RecordCollisions();
 
             RecordNeighborSearch();
             RecordNeighborList();
@@ -507,8 +604,7 @@ namespace HydroSandbox
                 cmd.SetComputeBufferParam(dc, applyDeltaKernel, Ids.DeltaPosition, deltaPosition);
                 DispatchParticles(dc, applyDeltaKernel);
 
-                cmd.SetComputeBufferParam(collisionShader, containerKernel, Ids.Predicted, predicted);
-                DispatchParticles(collisionShader, containerKernel);
+                RecordCollisions();
             }
 
             var vs = velocityShader;
@@ -675,6 +771,14 @@ namespace HydroSandbox
             public static readonly int FrameSeed = Shader.PropertyToID("_FrameSeed");
             public static readonly int SpawnLayers = Shader.PropertyToID("_SpawnLayers");
             public static readonly int SpawnPattern = Shader.PropertyToID("_SpawnPattern");
+            public static readonly int ColliderCount = Shader.PropertyToID("_ColliderCount");
+            public static readonly int Colliders = Shader.PropertyToID("_Colliders");
+            public static readonly int ParticleRadius = Shader.PropertyToID("_ParticleRadius");
+            public static readonly int TerrainHeights = Shader.PropertyToID("_TerrainHeights");
+            public static readonly int TerrainOrigin = Shader.PropertyToID("_TerrainOrigin");
+            public static readonly int TerrainSize = Shader.PropertyToID("_TerrainSize");
+            public static readonly int TerrainResolution = Shader.PropertyToID("_TerrainResolution");
+            public static readonly int TerrainFriction = Shader.PropertyToID("_TerrainFriction");
 
             public static readonly int ScanCount = Shader.PropertyToID("_ScanCount");
             public static readonly int ScanInput = Shader.PropertyToID("_ScanInput");

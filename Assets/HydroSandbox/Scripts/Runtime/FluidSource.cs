@@ -9,6 +9,7 @@ namespace HydroSandbox
         Point,
         Line,
         Area,
+        Rectangle,
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -36,8 +37,10 @@ namespace HydroSandbox
 
         [SerializeField] FluidSourceShape shape = FluidSourceShape.Area;
 
-        [Tooltip("Line length or area diameter, in meters. Ignored for Point.")]
+        [Tooltip("Line length, area diameter or rectangle width (along the transform's right), in meters. Ignored for Point.")]
         [SerializeField, Min(0f)] float size = 0.05f;
+        [Tooltip("Rectangle height, along the transform's up axis, in meters.")]
+        [SerializeField, Min(0f)] float rectangleHeight = 0.1f;
 
         [Tooltip("Exit speed along the transform's forward axis, in m/s.")]
         [SerializeField, Min(0.01f)] float speed = 1.5f;
@@ -127,6 +130,15 @@ namespace HydroSandbox
                     for (int i = -m; i <= m; i++)
                         points.Add(new Vector2(i * spacing, 0f));
                     break;
+                case FluidSourceShape.Rectangle:
+                {
+                    int nu = Mathf.Max(1, Mathf.FloorToInt(size / spacing) + 1);
+                    int nv = Mathf.Max(1, Mathf.FloorToInt(rectangleHeight / spacing) + 1);
+                    for (int j = 0; j < nv; j++)
+                    for (int i = 0; i < nu; i++)
+                        points.Add(new Vector2((i - (nu - 1) * 0.5f) * spacing, (j - (nv - 1) * 0.5f) * spacing));
+                    break;
+                }
                 case FluidSourceShape.Area:
                     // Offsetting even widths by half a spacing centers the lattice on the nozzle.
                     float offset = (Mathf.FloorToInt(size / spacing) % 2 == 0) ? 0.5f : 0f;
@@ -149,6 +161,8 @@ namespace HydroSandbox
             Gizmos.matrix = transform.localToWorldMatrix;
             if (shape == FluidSourceShape.Line)
                 Gizmos.DrawLine(Vector3.left * size * 0.5f, Vector3.right * size * 0.5f);
+            else if (shape == FluidSourceShape.Rectangle)
+                Gizmos.DrawWireCube(Vector3.zero, new Vector3(size, rectangleHeight, 0f));
             else
                 Gizmos.DrawWireSphere(Vector3.zero, Mathf.Max(size * 0.5f, 0.01f));
             Gizmos.DrawLine(Vector3.zero, Vector3.forward * 0.15f);
