@@ -45,8 +45,8 @@ namespace HydroSandbox
         [Tooltip("Exit speed along the transform's forward axis, in m/s.")]
         [SerializeField, Min(0.01f)] float speed = 1.5f;
 
-        [Tooltip("Per-particle fluid type written to every particle this source emits.")]
-        [SerializeField] uint fluidType;
+        [Tooltip("Liquid (index into the solver's FluidMixing) of every particle this source emits.")]
+        [SerializeField, Range(0, FluidMixing.MaxLiquids - 1)] uint fluidType;
 
         [SerializeField] bool pulsed;
         [SerializeField, Min(0.01f)] float pulsePeriod = 1f;
@@ -54,6 +54,8 @@ namespace HydroSandbox
 
         float travel;
         float time;
+
+        public int Liquid => (int)fluidType;
 
         public float Speed
         {

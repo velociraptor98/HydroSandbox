@@ -25,11 +25,11 @@ RWStructuredBuffer<uint2> _ParticleCell;
 StructuredBuffer<float4> _Positions;
 StructuredBuffer<float4> _Predicted;
 StructuredBuffer<float4> _Velocities;
-StructuredBuffer<uint> _FluidType;
+StructuredBuffer<float4> _Composition;
 RWStructuredBuffer<float4> _PositionsOut;
 RWStructuredBuffer<float4> _PredictedOut;
 RWStructuredBuffer<float4> _VelocitiesOut;
-RWStructuredBuffer<uint> _FluidTypeOut;
+RWStructuredBuffer<float4> _CompositionOut;
 RWStructuredBuffer<uint> _SortedCellId;
 RWStructuredBuffer<uint> _FluidStateOut;
 
@@ -144,7 +144,7 @@ void ReorderParticles(uint3 id : SV_DispatchThreadID)
     _PositionsOut[dst] = _Positions[i];
     _PredictedOut[dst] = _Predicted[i];
     _VelocitiesOut[dst] = _Velocities[i];
-    _FluidTypeOut[dst] = _FluidType[i];
+    _CompositionOut[dst] = _Composition[i];
     _SortedCellId[dst] = cell.x;
 }
 

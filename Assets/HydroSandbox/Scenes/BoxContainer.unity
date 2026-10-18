@@ -327,7 +327,8 @@ MonoBehaviour:
     solverIterations: 3
     particleRadius: 0.02
     restDensity: 1000
-    viscosity: 0.05
+    viscosity: 0.01
+    vorticityConfinement: 0.04
     gravity: {x: 0, y: -9.81, z: 0}
     cohesion: 0
     timeStep: 0.016666668
@@ -420,6 +421,7 @@ MonoBehaviour:
   refractionStrength: 0.035
   smoothness: 0.95
   edgeOpacity: 60
+  opticsRadiusScale: 2.2
   rippleNormal: {fileID: 2800000, guid: 70208cc22caf44efa9833764448bcddb, type: 3}
   rippleStrength: 0.35
   rippleScale: 1.6
@@ -427,6 +429,8 @@ MonoBehaviour:
   flowSpeedMin: 0.8
   flowSpeedRange: 2
   flowSheen: 0.35
+  dropletMaxNeighbors: 3
+  dropletRadius: 0.7
   whitewaterRadius: 0.4
   whitewaterMinPixels: 1.2
   sprayIntensity: 0.5

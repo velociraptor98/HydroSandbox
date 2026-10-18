@@ -4,6 +4,7 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.SceneManagement;
+using static HydroSandbox.Editor.SceneBuilderUtility;
 
 namespace HydroSandbox.Editor
 {
@@ -16,7 +17,6 @@ namespace HydroSandbox.Editor
     {
         const string Root = "Assets/HydroSandbox";
         const string ScenePath = Root + "/Scenes/WallFountain.unity";
-        const string MaterialFolder = Root + "/Materials";
         const string TextureFolder = Root + "/Textures";
 
         // Basin interior, in meters. Water sits on y = 0.
@@ -152,7 +152,10 @@ namespace HydroSandbox.Editor
             so.FindProperty("settings.particleRadius").floatValue = ParticleRadius;
             so.FindProperty("settings.substeps").intValue = 4;
             so.FindProperty("settings.solverIterations").intValue = 3;
-            so.FindProperty("settings.cohesion").floatValue = 0.3f;
+            // Enough to keep the thin jet from beading; more makes the pool look syrupy.
+            so.FindProperty("settings.cohesion").floatValue = 0.15f;
+            so.FindProperty("settings.viscosity").floatValue = 0.01f;
+            so.FindProperty("settings.vorticityConfinement").floatValue = 0.04f;
             so.ApplyModifiedPropertiesWithoutUndo();
 
             var whitewater = fluid.AddComponent<FluidWhitewater>();
@@ -245,90 +248,6 @@ namespace HydroSandbox.Editor
             material.EnableKeyword("_OCCLUSIONMAP");
             EditorUtility.SetDirty(material);
             return material;
-        }
-
-        static Material LoadOrCreateMaterial(string name, string shaderName)
-        {
-            if (!AssetDatabase.IsValidFolder(MaterialFolder))
-                AssetDatabase.CreateFolder(Root, "Materials");
-            string path = $"{MaterialFolder}/{name}.mat";
-            var material = AssetDatabase.LoadAssetAtPath<Material>(path);
-            if (material == null)
-            {
-                material = new Material(Shader.Find(shaderName));
-                AssetDatabase.CreateAsset(material, path);
-            }
-            return material;
-        }
-
-        /// <summary>
-        /// A box whose UVs are in world meters divided by <paramref name="textureMeters"/>, so stone
-        /// keeps a consistent scale however the box is sized (Unity's cube stretches 0..1 per face).
-        /// </summary>
-        static GameObject Box(Transform parent, string name, Vector3 center, Vector3 size, Material material, float textureMeters)
-        {
-            var go = new GameObject(name);
-            go.transform.SetParent(parent);
-            go.transform.position = center;
-            go.AddComponent<MeshFilter>().sharedMesh = BoxMesh(name, size, textureMeters);
-            go.AddComponent<MeshRenderer>().sharedMaterial = material;
-            GameObjectUtility.SetStaticEditorFlags(go, StaticEditorFlags.BatchingStatic);
-            return go;
-        }
-
-        static Mesh BoxMesh(string name, Vector3 size, float textureMeters)
-        {
-            Vector3 e = size * 0.5f;
-            var vertices = new System.Collections.Generic.List<Vector3>();
-            var normals = new System.Collections.Generic.List<Vector3>();
-            var uvs = new System.Collections.Generic.List<Vector2>();
-            var triangles = new System.Collections.Generic.List<int>();
-
-            void Face(Vector3 normal, Vector3 u, Vector3 v, float uSize, float vSize)
-            {
-                int start = vertices.Count;
-                Vector3 c = Vector3.Scale(normal, e);
-                Vector3 du = u * (uSize * 0.5f);
-                Vector3 dv = v * (vSize * 0.5f);
-                vertices.Add(c - du - dv);
-                vertices.Add(c + du - dv);
-                vertices.Add(c + du + dv);
-                vertices.Add(c - du + dv);
-                for (int i = 0; i < 4; i++)
-                    normals.Add(normal);
-                float su = uSize / textureMeters;
-                float sv = vSize / textureMeters;
-                uvs.Add(new Vector2(0, 0));
-                uvs.Add(new Vector2(su, 0));
-                uvs.Add(new Vector2(su, sv));
-                uvs.Add(new Vector2(0, sv));
-                triangles.AddRange(new[] { start, start + 2, start + 1, start, start + 3, start + 2 });
-            }
-
-            Face(Vector3.forward, Vector3.left, Vector3.up, size.x, size.y);
-            Face(Vector3.back, Vector3.right, Vector3.up, size.x, size.y);
-            Face(Vector3.right, Vector3.forward, Vector3.up, size.z, size.y);
-            Face(Vector3.left, Vector3.back, Vector3.up, size.z, size.y);
-            Face(Vector3.up, Vector3.right, Vector3.forward, size.x, size.z);
-            Face(Vector3.down, Vector3.right, Vector3.back, size.x, size.z);
-
-            var mesh = new Mesh { name = name };
-            mesh.SetVertices(vertices);
-            mesh.SetNormals(normals);
-            mesh.SetUVs(0, uvs);
-            mesh.SetTriangles(triangles, 0);
-            mesh.RecalculateTangents();
-            mesh.RecalculateBounds();
-            return mesh;
-        }
-
-        static void AddSceneToBuild(string path)
-        {
-            var scenes = new System.Collections.Generic.List<EditorBuildSettingsScene>(EditorBuildSettings.scenes);
-            if (scenes.Exists(s => s.path == path))
-                return;
-            scenes.Add(new EditorBuildSettingsScene(path, true));
-            EditorBuildSettings.scenes = scenes.ToArray();
         }
     }
 }

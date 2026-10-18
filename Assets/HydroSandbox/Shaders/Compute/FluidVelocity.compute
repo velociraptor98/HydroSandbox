@@ -1,4 +1,5 @@
 #pragma kernel UpdateVelocity
+#pragma kernel ComputeVorticity
 #pragma kernel ApplyViscosity
 
 #include "FluidNeighbors.hlsl"
@@ -7,6 +8,13 @@ RWStructuredBuffer<float4> _Positions;
 RWStructuredBuffer<float4> _Predicted;
 RWStructuredBuffer<float4> _Velocities;
 RWStructuredBuffer<float4> _VelocitiesOut;
+StructuredBuffer<float4> _Composition;
+RWStructuredBuffer<float4> _CompositionOut;
+// Curl of the velocity field (xyz) and its magnitude (w), from ComputeVorticity.
+RWStructuredBuffer<float4> _Vorticity;
+StructuredBuffer<float4> _VorticityIn;
+
+float _VorticityConfinement;
 
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void UpdateVelocity(uint3 id : SV_DispatchThreadID)
@@ -25,6 +33,113 @@ void UpdateVelocity(uint3 id : SV_DispatchThreadID)
     _Positions[i] = predicted;
 }
 
+// Vorticity confinement (Fedkiw et al. 2001, as used by Macklin & Mueller 2013): the solver's
+// damping (XSPH, the soft density solve) smears out small eddies, which is much of what makes
+// PBF water look viscous. Each particle is pushed along N x omega, where N points up the
+// gradient of vorticity magnitude, which spins existing eddies back up without adding net
+// momentum. Per substep the push is _VorticityConfinement * h * |omega| at most, so the setting
+// is scale free like the XSPH blend.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeVorticity(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _FluidState[0])
+        return;
+
+    float3 pi = _Predicted[i].xyz;
+    float3 vi = _Velocities[i].xyz;
+    float3 curl = 0;
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Predicted[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        curl += cross(SpikyGradient(r, r2, i, j), _Velocities[j].xyz - vi);
+    END_FOR_EACH_NEIGHBOR
+    curl *= _ParticleMass * _InvRestDensity;
+    _Vorticity[i] = float4(curl, length(curl));
+}
+
+// Gradient term of the vorticity magnitude for one neighbor; summed over neighbors it gives eta.
+float3 VorticityGradientTerm(float4 vorticityI, uint j, float3 r, float r2, uint i)
+{
+    return (_VorticityIn[j].w - vorticityI.w) * SpikyGradient(r, r2, i, j);
+}
+
+float3 Confinement(float4 vorticityI, float3 eta, float strength)
+{
+    float3 n = eta * rsqrt(max(dot(eta, eta), 1e-12));
+    return strength * _SmoothingRadius * cross(n, vorticityI.xyz);
+}
+
+// Multi-liquid version of ApplyViscosity, in the same neighbor pass:
+// - XSPH viscosity with the pair's harmonic mean viscosity: at an interface the runnier liquid
+//   shears and sets the drag, so honey still sinks through water.
+// - Buoyancy. The density constraint treats every liquid alike (equal rest volume), so gravity
+//   alone would never layer them. A particle denser than its kernel-weighted surroundings gets
+//   the net weight of its density excess, g (1 - rho_neighborhood / rho_i), and a lighter one
+//   rises; inside one liquid the term vanishes.
+// - Particles of different composition repel along their separation, which minimizes the
+//   interface between them (interfacial tension), so liquids separate and bead. The strength is
+//   -1/2 d^T T d with d = ci - cj: the pair tension for two pure liquids, falling to zero as
+//   compositions converge, so a miscible blob holds together until it has dissolved.
+// - Miscible pairs exchange composition (diffusion). Exchange is symmetric, so every liquid's
+//   total is conserved.
+void ApplyMixing(uint i)
+{
+    float3 pi = _Predicted[i].xyz;
+    float3 vi = _Velocities[i].xyz;
+    float4 ci = _Composition[i];
+    float viscosityI = dot(ci, _LiquidViscosity);
+    float densityI = dot(ci, _LiquidDensity);
+    float4 diffusionRow = mul(_PairDiffusion, ci);
+
+    float selfWeight = Poly6(0);
+    float weightSum = selfWeight;
+    float densitySum = densityI * selfWeight;
+    float3 viscositySum = 0;
+    float3 repulsion = 0;
+    float4 exchange = 0;
+    float4 vorticityI = _VorticityIn[i];
+    float3 eta = 0;
+
+    FOR_EACH_NEIGHBOR(i, j)
+        float3 r = pi - _Predicted[j].xyz;
+        float r2 = dot(r, r);
+        if (r2 >= _SmoothingRadiusSq)
+            continue;
+        float w = Poly6(r2);
+        float4 cj = _Composition[j];
+        float viscosityJ = dot(cj, _LiquidViscosity);
+        float viscosity = 2.0 * viscosityI * viscosityJ / max(viscosityI + viscosityJ, 1e-6);
+        viscositySum += viscosity * (_Velocities[j].xyz - vi) * w;
+        densitySum += dot(cj, _LiquidDensity) * w;
+        weightSum += w;
+        exchange += dot(cj, diffusionRow) * (cj - ci) * w;
+        float4 d = ci - cj;
+        float tension = max(-0.5 * dot(d, mul(_PairTension, d)), 0.0);
+        float len = sqrt(r2);
+        if (len > 1e-6)
+            repulsion += tension * w * (r / len);
+        if (_VorticityConfinement > 0.0)
+            eta += VorticityGradientTerm(vorticityI, j, r, r2, i);
+    END_FOR_EACH_NEIGHBOR
+
+    float massOverRest = _ParticleMass * _InvRestDensity;
+    float3 v = vi + massOverRest * viscositySum;
+    v += _Gravity * ((1.0 - densitySum / (weightSum * densityI)) * _BuoyancyScale * _DeltaTime);
+    v += repulsion * (massOverRest * _DeltaTime);
+    // Thick liquids do not form eddies, so confinement fades out as viscosity rises: honey and
+    // oil are left alone, water keeps nearly all of it.
+    if (_VorticityConfinement > 0.0)
+        v += Confinement(vorticityI, eta, _VorticityConfinement * saturate(1.0 - viscosityI * 4.0));
+    float4 c = max(ci + exchange * (massOverRest * _DeltaTime), 0);
+    c /= max(dot(c, 1), 1e-6);
+
+    _VelocitiesOut[i] = float4(v, 0);
+    _CompositionOut[i] = c;
+}
+
 // XSPH: blend each velocity toward its kernel-weighted neighborhood average. Written to a
 // second buffer because neighbors read the unsmoothed velocities.
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
@@ -33,10 +148,17 @@ void ApplyViscosity(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _FluidState[0])
         return;
+    if (_MultiFluid != 0)
+    {
+        ApplyMixing(i);
+        return;
+    }
 
     float3 pi = _Predicted[i].xyz;
     float3 vi = _Velocities[i].xyz;
     float3 sum = 0;
+    float4 vorticityI = _VorticityIn[i];
+    float3 eta = 0;
 
     FOR_EACH_NEIGHBOR(i, j)
         float3 r = pi - _Predicted[j].xyz;
@@ -44,8 +166,12 @@ void ApplyViscosity(uint3 id : SV_DispatchThreadID)
         if (r2 >= _SmoothingRadiusSq)
             continue;
         sum += (_Velocities[j].xyz - vi) * Poly6(r2);
+        if (_VorticityConfinement > 0.0)
+            eta += VorticityGradientTerm(vorticityI, j, r, r2, i);
     END_FOR_EACH_NEIGHBOR
 
     float3 v = vi + _Viscosity * (_ParticleMass * _InvRestDensity) * sum;
+    if (_VorticityConfinement > 0.0)
+        v += Confinement(vorticityI, eta, _VorticityConfinement);
     _VelocitiesOut[i] = float4(v, 0);
 }

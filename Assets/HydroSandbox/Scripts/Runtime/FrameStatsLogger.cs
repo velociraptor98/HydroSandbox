@@ -6,8 +6,9 @@ namespace HydroSandbox
 {
     /// <summary>
     /// Launching a player with -hydroFrameStats logs frame timings for whatever scene loads, then
-    /// quits: 120 warm-up frames, then 600 measured frames with vsync off. Adding
-    /// -hydroScreenshot &lt;path&gt; also saves the last frame as a PNG.
+    /// quits: 120 warm-up frames (-hydroWarmup N to change, e.g. to reach a steady state), then
+    /// 600 measured frames with vsync off. Adding -hydroScreenshot &lt;path&gt; also saves the
+    /// last frame as a PNG.
     /// </summary>
     public class FrameStatsLogger : MonoBehaviour
     {
@@ -28,7 +29,10 @@ namespace HydroSandbox
         {
             QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = -1;
-            for (int i = 0; i < WarmupFrames; i++)
+            string[] args = System.Environment.GetCommandLineArgs();
+            int warmupArg = System.Array.IndexOf(args, "-hydroWarmup");
+            int warmup = warmupArg >= 0 && warmupArg + 1 < args.Length && int.TryParse(args[warmupArg + 1], out int n) ? n : WarmupFrames;
+            for (int i = 0; i < warmup; i++)
                 yield return null;
 
             var frameMs = new List<float>(SampleFrames);
@@ -59,7 +63,6 @@ namespace HydroSandbox
             Debug.Log($"HydroSandbox frame stats | {UnityEngine.SceneManagement.SceneManager.GetActiveScene().name} | " +
                       $"{SystemInfo.graphicsDeviceName} {SystemInfo.graphicsDeviceType} | {Screen.width}x{Screen.height} | " +
                       $"{particles} | frame avg {average:F2} ms, p95 {p95:F2} ms ({1000f / average:F0} FPS) | GPU frame avg {gpu} ms");
-            string[] args = System.Environment.GetCommandLineArgs();
             int screenshotArg = System.Array.IndexOf(args, "-hydroScreenshot");
             if (screenshotArg >= 0 && screenshotArg + 1 < args.Length)
             {

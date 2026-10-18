@@ -9,10 +9,12 @@ using UnityEngine.SceneManagement;
 namespace HydroSandbox.Editor
 {
     /// <summary>
-    /// Builds the mountain-stream scene: a procedurally carved, stepped stream channel on a Unity
-    /// Terrain, boulders the water splits around, and floating logs carried downstream (two-way
-    /// coupled Rigidbodies). Water enters through a rectangular source at the top of the reach
-    /// and drains at the bottom. Re-running rebuilds the scene and terrain from scratch.
+    /// Builds the mountain-stream scene: a procedurally carved cascade on a Unity Terrain. An
+    /// upper run with riffles pours over a rock lip as a waterfall into a deep plunge pool, spills
+    /// over the pool's sill into two boulder-garden steps, and calms into a run-out. Boulders split
+    /// the water and floating logs (two-way coupled Rigidbodies) are carried down, over the fall
+    /// too. Water enters through a rectangular source at the top of the reach and drains over a
+    /// weir at the bottom. Re-running rebuilds the scene and terrain from scratch.
     /// </summary>
     public static class RiverSceneBuilder
     {
@@ -25,15 +27,26 @@ namespace HydroSandbox.Editor
 
         const float TerrainSizeX = 26f;
         const float TerrainSizeZ = 14f;
-        const float TerrainHeight = 6f;
+        const float TerrainHeight = 8f;
         const int HeightmapResolution = 513;
         const int AlphamapResolution = 512;
         static readonly Vector3 TerrainOrigin = new Vector3(-13f, -1f, -7f);
 
         const float ReachStart = -11.5f;
         const float ReachEnd = 11.5f;
-        const float ParticleRadius = 0.02f;
+        // Coarser than the other scenes: the reach and its plunge pool hold about 21 m^3 of
+        // water, which at 2 cm particles would need some 330k of them.
+        const float ParticleRadius = 0.034f;
         const float LogDensity = 600f;
+
+        const float RiverDepth = 0.42f;
+        // Lip of the waterfall, and the pool below it: spill level and its sill downstream.
+        const float FallX = -3.5f;
+        const float PoolEndX = 0.3f;
+        const float PoolLevel = 1.45f;
+        const float RiverSpeed = 1.0f;
+        const float BedFriction = 0.004f;
+        const float WeirHeight = 0.2f;
 
         // ---- Landform -----------------------------------------------------------------------
 
@@ -41,14 +54,23 @@ namespace HydroSandbox.Editor
 
         static float CenterlineSlope(float x) => 1.1f * 0.32f * Mathf.Cos(x * 0.32f) + 0.35f * 0.85f * Mathf.Cos(x * 0.85f + 1.3f);
 
-        // A gentle grade with two steps; the water accelerates over each step into rapids.
-        static float BedHeight(float x)
+        static float Step(float from, float to, float x) => Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(from, to, x));
+
+        // Bed along the reach: an upper run, a 2 m drop over the lip into the plunge pool, which
+        // shallows toward its sill, then a grade with two steps into rapids. The drop is
+        // fallWidth long: 15 cm makes the waterfall face near vertical.
+        static float BedHeight(float x, float fallWidth = 0.15f)
         {
-            float h = 1.35f - 0.028f * (x + 12f);
-            h -= 0.3f * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(-3.6f, -2.8f, x));
-            h -= 0.35f * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(4.0f, 4.7f, x));
-            return h;
+            float upper = 3.0f - 0.03f * (x + 12f);
+            float pool = 0.8f + 0.3f * Step(-1.2f, PoolEndX, x);
+            float lower = 1.1f - 0.025f * (x - PoolEndX) - 0.35f * Step(2.8f, 3.3f, x) - 0.3f * Step(6.2f, 6.7f, x);
+            if (x >= PoolEndX)
+                return lower;
+            return Mathf.Lerp(upper, pool, Step(FallX - fallWidth * 0.66f, FallX + fallWidth * 0.33f, x));
         }
+
+        // 0 outside the plunge pool, 1 inside it: the channel widens and its banks rise there.
+        static float PoolWeight(float x) => Step(FallX - 0.3f, FallX + 0.5f, x) * (1f - Step(-0.6f, PoolEndX + 0.2f, x));
 
         static float Fbm(float x, float z)
         {
@@ -65,9 +87,17 @@ namespace HydroSandbox.Editor
         static float Height(float x, float z)
         {
             float d = Mathf.Abs(z - CenterlineZ(x));
-            float bed = BedHeight(x);
-            float banks = 0.75f * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.6f, 1.45f, d));
-            float valley = 0.3f * Mathf.Max(0f, d - 1.45f) + 1.6f * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(3f, 7f, d));
+            // The escarpment is a sheer face only where the water falls; away from the channel it
+            // grades into a steep rocky slope (terrain textures smear on vertical faces) whose
+            // line wanders across the valley.
+            float nearFall = Mathf.Exp(-Mathf.Pow((x - FallX) / 1.5f, 2f));
+            float cliffShift = (-0.3f * Step(0.6f, 3.5f, d) + 0.5f * Fbm(z * 0.9f, 7.7f)) * nearFall;
+            float bed = BedHeight(x + cliffShift, Mathf.Lerp(0.15f, 1.8f, Step(0.65f, 2.2f, d)));
+            float pool = PoolWeight(x);
+            float halfWidth = 0.6f + 0.8f * pool;
+            float bankHeight = 0.75f + 0.6f * pool;
+            float banks = bankHeight * Step(halfWidth, halfWidth + 0.85f, d);
+            float valley = 0.3f * Mathf.Max(0f, d - halfWidth - 0.85f) + 1.6f * Step(3f, 7f, d);
             float bedRoughness = 0.04f * Fbm(x * 1.8f, z * 1.8f);
             float hills = 0.7f * Fbm(x * 0.25f, z * 0.25f) * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(1.5f, 4f, d));
             return bed + banks + valley + bedRoughness + hills;
@@ -125,8 +155,8 @@ namespace HydroSandbox.Editor
             camera.farClipPlane = 300f;
             camera.GetUniversalAdditionalCameraData().renderPostProcessing = true;
             var orbit = camera.gameObject.AddComponent<OrbitCamera>();
-            // Framed on the first step, where the rapids and the boulders around it are.
-            orbit.Frame(new Vector3(-3.2f, BedHeight(-3.2f) + 0.2f, CenterlineZ(-3.2f)), 4.8f, 25f, 32f);
+            // From downstream, looking up the cascade: run-out, plunge pool, fall and upper run.
+            orbit.Frame(new Vector3(-2.0f, PoolLevel + 0.15f, -0.3f), 8f, -85f, 27f);
 
             var profile = AssetDatabase.LoadAssetAtPath<VolumeProfile>("Assets/Settings/SampleSceneProfile.asset");
             if (profile != null)
@@ -182,6 +212,7 @@ namespace HydroSandbox.Editor
             var collider = go.AddComponent<FluidTerrainCollider>();
             var so = new SerializedObject(collider);
             so.FindProperty("terrain").objectReferenceValue = terrain;
+            so.FindProperty("friction").floatValue = BedFriction;
             so.ApplyModifiedPropertiesWithoutUndo();
             return terrain;
         }
@@ -241,18 +272,33 @@ namespace HydroSandbox.Editor
             // (x along the reach, offset from the centerline, size in meters, yaw)
             var placements = new (float x, float offset, float size, float yaw, bool slab)[]
             {
-                (-8.6f, 0.18f, 0.45f, 20f, false),
-                (-6.1f, -0.28f, 0.36f, 80f, false),
-                // Staggered across each step so they narrow the flow into rapids without damming it.
-                (-3.4f, 0.3f, 0.45f, 140f, false),
-                (-2.4f, -0.35f, 0.36f, 10f, false),
-                (0.4f, 0.02f, 0.6f, 60f, true),
-                (3.6f, -0.3f, 0.42f, 110f, false),
-                (4.9f, 0.32f, 0.45f, 200f, false),
-                (7.6f, 0.1f, 0.42f, 300f, false),
+                // Upper run: staggered riffle stones, big enough to break bank-full water.
+                (-9.6f, 0.25f, 0.7f, 20f, false),
+                (-8.1f, -0.32f, 0.65f, 80f, false),
+                (-6.3f, 0.15f, 0.9f, 60f, true),
+                (-4.7f, -0.35f, 0.6f, 140f, false),
+                // Flanking the lip, so the fall pours through a notch, and fallen blocks at the foot
+                // of the sheer face on either side of the falling water.
+                (FallX - 0.25f, 0.75f, 0.95f, 10f, false),
+                (FallX - 0.3f, -0.8f, 0.85f, 200f, false),
+                // Around and in the plunge pool.
+                (-2.6f, -1.35f, 0.95f, 300f, false),
+                (-1.4f, 1.25f, 1.05f, 120f, false),
+                (-0.7f, 0.3f, 0.7f, 45f, false),
+                // On the sill and through the two steps below: boulder gardens and chutes.
+                (0.45f, -0.5f, 0.7f, 250f, false),
+                (0.6f, 0.5f, 0.65f, 90f, false),
+                (2.9f, -0.3f, 0.7f, 110f, false),
+                (3.3f, 0.38f, 0.6f, 330f, false),
+                (4.1f, -0.05f, 0.75f, 15f, true),
+                (6.3f, 0.32f, 0.75f, 200f, false),
+                (6.7f, -0.38f, 0.65f, 70f, false),
+                (8.6f, 0.1f, 0.65f, 300f, false),
                 // On the banks, for the look of the valley.
-                (-5f, 1.7f, 0.9f, 30f, false),
-                (2.2f, -1.9f, 1.1f, 160f, true),
+                (-7.4f, -1.8f, 1.0f, 30f, false),
+                (-5f, 1.9f, 1.1f, 30f, false),
+                (-2.1f, -2.5f, 1.3f, 160f, true),
+                (1.8f, -1.9f, 1.1f, 160f, true),
                 (8.8f, 1.6f, 0.8f, 250f, false),
             };
             int index = 0;
@@ -263,6 +309,15 @@ namespace HydroSandbox.Editor
                 // Sink the rock about a third into the ground so it reads as bedded, not dropped.
                 Vector3 bottom = new Vector3(p.x, Height(p.x, z) - p.size * 0.3f, z);
                 Place(parent, $"Boulder{index++}", mesh, p.slab ? slabMaterial : boulderMaterial, bottom, p.size, p.yaw);
+            }
+
+            // Fallen blocks in the pool against the sheer face on either side of the fall: they
+            // hide the lower face, where terrain textures smear, and frame the falling water.
+            foreach (float offset in new[] { 1.0f, -1.05f })
+            {
+                float z = CenterlineZ(FallX) + offset;
+                var bottom = new Vector3(FallX + 0.3f, BedHeight(FallX + 0.5f) - 0.15f, z);
+                Place(parent, $"FaceBlock{index++}", boulder, boulderMaterial, bottom, 1.5f, offset > 0f ? 35f : 215f);
             }
         }
 
@@ -315,13 +370,18 @@ namespace HydroSandbox.Editor
                          ("emissionShader", "FluidEmission"),
                      })
                 so.FindProperty(field).objectReferenceValue = AssetDatabase.LoadAssetAtPath<ComputeShader>($"{Root}/Shaders/Compute/{file}.compute");
-            so.FindProperty("capacity").intValue = 150000;
+            so.FindProperty("capacity").intValue = 110000;
             so.FindProperty("initialParticles").intValue = 0;
-            so.FindProperty("container").boundsValue = new Bounds(new Vector3(-0.25f, 1.5f, 0f), new Vector3(23.5f, 4f, 13.5f));
+            so.FindProperty("container").boundsValue = new Bounds(new Vector3(-0.25f, 2.25f, 0f), new Vector3(23.5f, 5.5f, 13.5f));
             so.FindProperty("settings.particleRadius").floatValue = ParticleRadius;
-            so.FindProperty("settings.substeps").intValue = 4;
+            so.FindProperty("settings.substeps").intValue = 3;
             so.FindProperty("settings.solverIterations").intValue = 3;
+            // More cohesion holds the falling sheet together but makes splashes blobby and the
+            // water look syrupy; at this particle size even 0.3 is far stronger than real surface
+            // tension.
             so.FindProperty("settings.cohesion").floatValue = 0.1f;
+            so.FindProperty("settings.viscosity").floatValue = 0.01f;
+            so.FindProperty("settings.vorticityConfinement").floatValue = 0.04f;
             so.ApplyModifiedPropertiesWithoutUndo();
 
             var coupling = fluid.AddComponent<FluidRigidbodyCoupling>();
@@ -334,10 +394,13 @@ namespace HydroSandbox.Editor
             var whitewaterSo = new SerializedObject(whitewater);
             whitewaterSo.FindProperty("whitewaterShader").objectReferenceValue =
                 AssetDatabase.LoadAssetAtPath<ComputeShader>($"{Root}/Shaders/Compute/FluidWhitewater.compute");
+            // The fall's impact alone would fill a 256k pool; each live particle is advected and
+            // drawn every frame, so a smaller pool and gentler emission keep whitewater affordable.
+            whitewaterSo.FindProperty("capacity").intValue = 98304;
             whitewaterSo.FindProperty("trappedAirRange").vector2Value = new Vector2(5f, 22f);
-            whitewaterSo.FindProperty("trappedAirRate").floatValue = 300f;
+            whitewaterSo.FindProperty("trappedAirRate").floatValue = 150f;
             whitewaterSo.FindProperty("energyRange").vector2Value = new Vector2(0.6f, 6f);
-            whitewaterSo.FindProperty("lifetimeRange").vector2Value = new Vector2(1f, 3f);
+            whitewaterSo.FindProperty("lifetimeRange").vector2Value = new Vector2(0.8f, 2.2f);
             whitewaterSo.ApplyModifiedPropertiesWithoutUndo();
 
             var surface = fluid.AddComponent<FluidSurface>();
@@ -347,8 +410,9 @@ namespace HydroSandbox.Editor
             surfaceSo.FindProperty("surfaceShader").objectReferenceValue = Shader.Find("HydroSandbox/FluidSurface");
             surfaceSo.FindProperty("rippleNormal").objectReferenceValue = AssetDatabase.LoadAssetAtPath<Texture2D>($"{TextureFolder}/Water/WaterRipples_Normal.png");
             surfaceSo.FindProperty("foamMask").objectReferenceValue = AssetDatabase.LoadAssetAtPath<Texture2D>($"{TextureFolder}/Water/Foam002_Mask.png");
-            // Mountain water: clearer and greener than the tinted fountain pool.
-            surfaceSo.FindProperty("absorption").vector3Value = new Vector3(1.1f, 0.35f, 0.45f);
+            // Mountain water: clearer and greener than the tinted fountain pool, but absorbing enough
+            // that the deep middle of the channel reads darker than the margins.
+            surfaceSo.FindProperty("absorption").vector3Value = new Vector3(1.8f, 0.55f, 0.7f);
             surfaceSo.FindProperty("scatterColor").colorValue = new Color(0.07f, 0.2f, 0.17f);
             surfaceSo.ApplyModifiedPropertiesWithoutUndo();
 
@@ -367,21 +431,23 @@ namespace HydroSandbox.Editor
             panelSo.FindProperty("viewMode").enumValueIndex = (int)FluidViewMode.Water;
             panelSo.ApplyModifiedPropertiesWithoutUndo();
 
-            // Inflow: a rectangle across the channel floor, aimed down the channel.
+            // Inflow: a rectangle across the channel, from the bed to near the surface, aimed down
+            // the channel.
             float sx = ReachStart;
             var source = new GameObject("Inflow").AddComponent<FluidSource>();
-            source.transform.position = new Vector3(sx, BedHeight(sx) + 0.11f, CenterlineZ(sx));
+            source.transform.position = new Vector3(sx, BedHeight(sx) + 0.05f + RiverDepth * 0.5f, CenterlineZ(sx));
             source.transform.rotation = Quaternion.LookRotation(new Vector3(1f, 0f, CenterlineSlope(sx)).normalized, Vector3.up);
             var sourceSo = new SerializedObject(source);
             sourceSo.FindProperty("shape").enumValueIndex = (int)FluidSourceShape.Rectangle;
-            sourceSo.FindProperty("size").floatValue = 1.0f;
-            sourceSo.FindProperty("rectangleHeight").floatValue = 0.16f;
-            sourceSo.FindProperty("speed").floatValue = 1.0f;
+            sourceSo.FindProperty("size").floatValue = 1.3f;
+            sourceSo.FindProperty("rectangleHeight").floatValue = RiverDepth;
+            sourceSo.FindProperty("speed").floatValue = RiverSpeed;
             sourceSo.ApplyModifiedPropertiesWithoutUndo();
 
-            // Outflow: everything that reaches the end of the reach is recycled.
+            // Outflow over a weir: only water above the sill is drained, so the end of the reach
+            // holds its depth instead of draining down to a free overfall.
             var sink = new GameObject("Outflow").AddComponent<FluidSink>();
-            sink.transform.position = new Vector3(ReachEnd - 0.4f, BedHeight(ReachEnd) + 1f, CenterlineZ(ReachEnd));
+            sink.transform.position = new Vector3(ReachEnd - 0.4f, BedHeight(ReachEnd) + WeirHeight + 1.5f, CenterlineZ(ReachEnd));
             sink.transform.localScale = new Vector3(1.4f, 3f, 5f);
             return fluid;
         }
@@ -390,9 +456,13 @@ namespace HydroSandbox.Editor
         static void AddRiverFill(GameObject fluid, Terrain terrain)
         {
             var points = new System.Collections.Generic.List<Vector3>();
+            // A point's height is a minimum water level: the pool fills to its spill level.
             for (float x = ReachStart; x <= ReachEnd - 0.8f; x += 0.5f)
-                points.Add(new Vector3(x, BedHeight(x), CenterlineZ(x)));
-            fluid.AddComponent<RiverFill>().Configure(terrain, points.ToArray(), 1.4f, 0.14f, 0.8f);
+            {
+                bool inPool = x > FallX + 0.1f && x < PoolEndX;
+                points.Add(new Vector3(x, inPool ? PoolLevel : BedHeight(x), CenterlineZ(x)));
+            }
+            fluid.AddComponent<RiverFill>().Configure(terrain, points.ToArray(), 4.0f, RiverDepth, RiverSpeed);
         }
 
         static void BuildLogs()
@@ -405,7 +475,7 @@ namespace HydroSandbox.Editor
             var respawn = new GameObject("LogRespawn").transform;
             respawn.SetParent(parent);
             float rx = ReachStart + 1.8f;
-            respawn.position = new Vector3(rx, BedHeight(rx) + 0.45f, CenterlineZ(rx));
+            respawn.position = new Vector3(rx, BedHeight(rx) + RiverDepth + 0.15f, CenterlineZ(rx));
             respawn.rotation = Quaternion.LookRotation(new Vector3(0f, 0f, 1f));
 
             var lengths = new[] { 1.1f, 0.9f, 1.3f, 1.0f };
@@ -415,7 +485,7 @@ namespace HydroSandbox.Editor
                 float x = ReachStart + 2f + i * 1.6f;
                 var go = new GameObject($"Log{i}");
                 go.transform.SetParent(parent);
-                go.transform.position = new Vector3(x, BedHeight(x) + 0.35f, CenterlineZ(x) + (i % 2 == 0 ? 0.12f : -0.12f));
+                go.transform.position = new Vector3(x, BedHeight(x) + RiverDepth + 0.05f, CenterlineZ(x) + (i % 2 == 0 ? 0.12f : -0.12f));
                 go.transform.rotation = Quaternion.Euler(0f, 70f + i * 25f, 0f);
                 // The trunk scan's long axis is X; scale it to a stream-sized log.
                 go.transform.localScale = new Vector3(lengths[i] / b.size.x, diameters[i] / b.size.y, diameters[i] / b.size.z);
@@ -448,7 +518,8 @@ namespace HydroSandbox.Editor
 
                 var recycler = go.AddComponent<DebrisRecycler>();
                 var recyclerSo = new SerializedObject(recycler);
-                recyclerSo.FindProperty("region").boundsValue = new Bounds(new Vector3(-0.5f, 1.5f, 0f), new Vector3(22.5f, 6f, 13f));
+                // Ends where the weir starts: the water over the sill is too shallow to float a log.
+                recyclerSo.FindProperty("region").boundsValue = new Bounds(new Vector3(-0.75f, 2.5f, 0f), new Vector3(22f, 7f, 13f));
                 recyclerSo.FindProperty("respawnPoint").objectReferenceValue = respawn;
                 recyclerSo.ApplyModifiedPropertiesWithoutUndo();
             }

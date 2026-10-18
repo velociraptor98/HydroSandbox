@@ -48,7 +48,7 @@ StructuredBuffer<float2> _SpawnPattern;
 RWStructuredBuffer<float4> _Positions;
 RWStructuredBuffer<float4> _Predicted;
 RWStructuredBuffer<float4> _Velocities;
-RWStructuredBuffer<uint> _FluidType;
+RWStructuredBuffer<float4> _Composition;
 
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
 void ApplySinks(uint3 id : SV_DispatchThreadID)
@@ -113,5 +113,6 @@ void SpawnParticles(uint3 id : SV_DispatchThreadID)
     _Positions[slot] = float4(position, 1);
     _Predicted[slot] = float4(position, 1);
     _Velocities[slot] = float4(layer.velocity, 0);
-    _FluidType[slot] = layer.fluidType;
+    uint liquid = layer.fluidType;
+    _Composition[slot] = float4(liquid == 0, liquid == 1, liquid == 2, liquid == 3);
 }

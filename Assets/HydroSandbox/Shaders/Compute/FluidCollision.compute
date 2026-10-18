@@ -7,6 +7,7 @@
 #pragma kernel ResolveContainer
 #pragma kernel ResolveColliders
 #pragma kernel ResolveTerrain
+#pragma kernel ResolveTank
 
 #include "FluidCommon.hlsl"
 
@@ -29,6 +30,7 @@ struct ColliderRecord
 
 RWStructuredBuffer<float4> _Predicted;
 StructuredBuffer<float4> _Positions;
+StructuredBuffer<float4> _Composition;
 
 uint _ColliderCount;
 StructuredBuffer<ColliderRecord> _Colliders;
@@ -40,6 +42,21 @@ float3 _TerrainOrigin;
 float3 _TerrainSize;
 uint _TerrainResolution;
 float _TerrainFriction;
+
+struct TankHole
+{
+    float3 center;          // on the wall's midplane
+    float radius;
+    uint wall;              // 0 = -X, 1 = +X, 2 = -Z, 3 = +Z
+    uint3 padding;
+};
+
+// Open-topped glass tank: interior bounds, wall thickness, holes drilled in the side walls.
+float3 _TankMin;
+float3 _TankMax;
+float _TankWall;
+uint _TankHoleCount;
+StructuredBuffer<TankHole> _TankHoles;
 
 float3 RotateVector(float4 q, float3 v)
 {
@@ -117,7 +134,19 @@ void ResolveContainer(uint3 id : SV_DispatchThreadID)
         return;
 
     // _ContainerMin/_ContainerMax are already inset by the particle radius.
-    _Predicted[i] = float4(clamp(p.xyz, _ContainerMin, _ContainerMax), p.w);
+    float3 clamped = clamp(p.xyz, _ContainerMin, _ContainerMax);
+    if (_MultiFluid != 0)
+    {
+        // Wall friction on the axes not being pushed; pulling toward the previous (inside)
+        // position cannot leave the box.
+        float3 hit = float3(clamped != p.xyz);
+        if (any(hit))
+        {
+            float friction = dot(_Composition[i], _LiquidWallFriction);
+            clamped -= (clamped - _Positions[i].xyz) * (1.0 - hit) * friction;
+        }
+    }
+    _Predicted[i] = float4(clamped, p.w);
 }
 
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]
@@ -195,5 +224,129 @@ void ResolveTerrain(uint3 id : SV_DispatchThreadID)
         return;
 
     p += Contact(p, _Positions[i].xyz, normal, distance, 0, _TerrainFriction);
+    _Predicted[i] = float4(p, p4.w);
+}
+
+// Wall slabs as boxes. The side walls reach from under the floor to the rim, and overlap at the
+// corners. Wall 4 is the floor.
+void TankWall(uint wall, out float3 center, out float3 extents, out float3 axis)
+{
+    float t = _TankWall;
+    float3 lo = float3(_TankMin.x - t, _TankMin.y - t, _TankMin.z - t);
+    float3 hi = float3(_TankMax.x + t, _TankMax.y, _TankMax.z + t);
+    if (wall == 4)
+    {
+        axis = float3(0, 1, 0);
+        hi.y = _TankMin.y;
+    }
+    else if (wall < 2)
+    {
+        axis = float3(1, 0, 0);
+        if (wall == 0) hi.x = _TankMin.x; else lo.x = _TankMax.x;
+    }
+    else
+    {
+        axis = float3(0, 0, 1);
+        if (wall == 2) hi.z = _TankMin.z; else lo.z = _TankMax.z;
+    }
+    center = (lo + hi) * 0.5;
+    extents = (hi - lo) * 0.5;
+}
+
+// Signed distance to a wall slab. The glass is about as thin as a particle, so a particle found
+// inside it leaves on the side it came from (its position at the start of the substep), not the
+// nearest one: otherwise a fast particle would be pushed through.
+float SlabDistance(float3 p, float3 previous, float3 center, float3 extents, out float3 normal)
+{
+    float3 local = p - center;
+    float3 q = abs(local) - extents;
+    float3 outside = max(q, 0);
+    float outsideLen = length(outside);
+    if (outsideLen > 0)
+    {
+        normal = outside / outsideLen * sign(local);
+        return outsideLen;
+    }
+
+    float3 prevLocal = previous - center;
+    float3 prevQ = abs(prevLocal) - extents;
+    float3 exitQ = prevQ;
+    float3 side = sign(prevLocal);
+    if (max(prevQ.x, max(prevQ.y, prevQ.z)) <= 0)
+    {
+        exitQ = q;
+        side = sign(local);
+    }
+    float3 k = exitQ.x >= exitQ.y && exitQ.x >= exitQ.z ? float3(1, 0, 0) : (exitQ.y >= exitQ.z ? float3(0, 1, 0) : float3(0, 0, 1));
+    float s = dot(side, k);
+    s = s != 0 ? s : 1.0;
+    normal = k * s;
+    return s * dot(local, k) - dot(extents, k);
+}
+
+// The tank is solid glass minus the drilled holes: per wall, max(slab, radius - distance from
+// the hole's axis), which near a hole's rim gives the bore as the nearest surface. Liquid that
+// gets out falls on whatever else is in the solver's container.
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ResolveTank(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+    float4 p4 = _Predicted[i];
+    if (!IsAlive(p4))
+        return;
+
+    float3 p = p4.xyz;
+    float r = _ParticleRadius;
+    float t = _TankWall;
+    float3 outerMin = _TankMin - t - r;
+    float3 outerMax = float3(_TankMax.x + t, _TankMax.y, _TankMax.z + t) + r;
+    if (any(p < outerMin) || any(p > outerMax))
+        return;
+    if (all(p > _TankMin + r) && all(p.xz < _TankMax.xz - r))
+        return;
+
+    float3 previous = _Positions[i].xyz;
+    float friction = _MultiFluid != 0 ? dot(_Composition[i], _LiquidWallFriction) : 0.0;
+    for (uint wall = 0; wall < 5; wall++)
+    {
+        float3 center, extents;
+        float3 axis;
+        TankWall(wall, center, extents, axis);
+        float3 normal;
+        float distance = SlabDistance(p, previous, center, extents, normal);
+
+        float bore = -1e9;
+        float3 boreNormal = 0;
+        for (uint h = 0; h < _TankHoleCount; h++)
+        {
+            TankHole hole = _TankHoles[h];
+            if (hole.wall != wall)
+                continue;
+            float3 d = p - hole.center;
+            d -= dot(d, axis) * axis;
+            float rho = length(d);
+            float b = hole.radius - rho;
+            if (b > bore)
+            {
+                bore = b;
+                boreNormal = rho > 1e-6 ? -d / rho : 0;
+            }
+        }
+        if (bore > 0 && distance > 0)
+        {
+            normal = normalize(distance * normal + bore * boreNormal);
+            distance = length(float2(distance, bore));
+        }
+        else if (bore > distance)
+        {
+            normal = boreNormal;
+            distance = bore;
+        }
+
+        if (distance < r && any(normal != 0))
+            p += Contact(p, previous, normal, distance, 0, friction);
+    }
     _Predicted[i] = float4(p, p4.w);
 }

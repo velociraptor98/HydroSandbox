@@ -5,13 +5,14 @@ namespace HydroSandbox
 {
     /// <summary>
     /// Starts a river already flowing: fills the channel along a centerline polyline, from the
-    /// terrain surface up to <see cref="depth"/> above the channel bed, with particles moving
-    /// downstream at <see cref="speed"/>. Points overlapping physics colliders (boulders, logs)
+    /// terrain surface up to <see cref="depth"/> above the channel bed (or up to the centerline
+    /// point's height, if higher: a pool's level), with particles moving downstream at
+    /// <see cref="speed"/>. Points overlapping physics colliders (boulders, logs)
     /// are skipped; particles placed inside an obstacle would be blasted out on the first step.
     /// </summary>
     public class RiverFill : FluidInitialFill
     {
-        [Tooltip("Channel centerline in world space, upstream first. Heights are ignored; the bed is the lowest terrain point across the channel.")]
+        [Tooltip("Channel centerline in world space, upstream first. Each point's height is a minimum water level (for pools); the bed is the lowest terrain point across the channel.")]
         [SerializeField] Vector3[] centerline = System.Array.Empty<Vector3>();
         [SerializeField] Terrain terrain;
         [Tooltip("Width of the strip to fill, centered on the centerline.")]
@@ -57,7 +58,7 @@ namespace HydroSandbox
                     float bed = float.MaxValue;
                     for (float w = -half; w <= half; w += spacing)
                         bed = Mathf.Min(bed, terrain.SampleHeight(center + across * w) + terrainY);
-                    float surface = bed + depth;
+                    float surface = Mathf.Max(bed + depth, Mathf.Lerp(a.y, b.y, t / length));
 
                     for (float w = -half; w <= half; w += spacing)
                     {

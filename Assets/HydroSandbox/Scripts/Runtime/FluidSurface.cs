@@ -27,6 +27,7 @@ namespace HydroSandbox
         [SerializeField, Range(1, 4)] int blurIterations = 2;
         [Tooltip("Depth difference, as a multiple of particle radius, beyond which the blur stops mixing.")]
         [SerializeField, Range(0.5f, 8f)] float blurDepthFalloff = 2.5f;
+        [Tooltip("Blur taps per side. Beyond this many pixels of radius the taps spread out rather than the filter shrinking.")]
         [SerializeField, Range(1, 48)] int blurMaxPixels = 24;
 
         [Header("Optics")]
@@ -37,6 +38,8 @@ namespace HydroSandbox
         [SerializeField, Range(0f, 1f)] float smoothness = 0.95f;
         [Tooltip("Opacity per meter of thickness at the thin edges of the water.")]
         [SerializeField, Min(0f)] float edgeOpacity = 60f;
+        [Tooltip("Mixed liquids only: color splat radius as a multiple of particle radius. Wider splats smooth the particle grain out of colored liquid at the cost of sharp interfaces.")]
+        [SerializeField, Range(1f, 4f)] float opticsRadiusScale = 2.2f;
 
         [Header("Ripples")]
         [SerializeField] Texture2D rippleNormal;
@@ -72,12 +75,16 @@ namespace HydroSandbox
         [SerializeField] Color foamTint = new Color(0.95f, 0.97f, 1f);
 
         Material material;
+        readonly Vector4[] liquidAbsorption = new Vector4[FluidMixing.MaxLiquids];
+        readonly Vector4[] liquidScattering = new Vector4[FluidMixing.MaxLiquids];
         static readonly Vector3[] AmbientDirections = { Vector3.up, Vector3.right, Vector3.down };
         readonly Color[] ambientColors = new Color[3];
 
         public FluidSolver Solver => solver;
         public FluidWhitewater Whitewater => whitewater != null && whitewater.isActiveAndEnabled && whitewater.IsReady ? whitewater : null;
         public int BlurIterations => blurIterations;
+        /// <summary>True when the solver mixes several liquids, which adds the optics pass.</summary>
+        public bool HasMixedLiquids => solver != null && solver.Mixing != null;
         public bool IsRenderable => isActiveAndEnabled && solver != null && solver.IsReady && surfaceShader != null;
 
         public Material Material
@@ -112,6 +119,17 @@ namespace HydroSandbox
             properties.SetInt(Ids.DropletMaxNeighbors, dropletMaxNeighbors);
         }
 
+        /// <summary>Particle-pass properties plus each liquid's optics, for the multi-liquid optics pass.</summary>
+        public void SetOpticsProperties(MaterialPropertyBlock properties)
+        {
+            SetParticleProperties(properties);
+            properties.SetBuffer(Ids.Composition, solver.CompositionBuffer);
+            properties.SetFloat(Ids.OpticsRadiusScale, opticsRadiusScale);
+            solver.Mixing.FillOptics(liquidAbsorption, liquidScattering);
+            properties.SetVectorArray(Ids.LiquidAbsorption, liquidAbsorption);
+            properties.SetVectorArray(Ids.LiquidScattering, liquidScattering);
+        }
+
         public void SetBlurProperties(MaterialPropertyBlock properties)
         {
             properties.SetFloat(Ids.BlurWorldRadius, blurRadius * solver.ParticleRadius);
@@ -127,6 +145,7 @@ namespace HydroSandbox
             properties.SetFloat(Ids.RefractionStrength, refractionStrength);
             properties.SetFloat(Ids.Smoothness, smoothness);
             properties.SetFloat(Ids.EdgeOpacity, edgeOpacity);
+            properties.SetFloat(Ids.ParticleRadius, solver.ParticleRadius);
             properties.SetTexture(Ids.RippleNormal, rippleNormal != null ? rippleNormal : Texture2D.normalTexture);
             properties.SetFloat(Ids.RippleStrength, rippleNormal != null ? rippleStrength : 0f);
             properties.SetFloat(Ids.RippleScale, rippleScale);
@@ -134,6 +153,7 @@ namespace HydroSandbox
             properties.SetFloat(Ids.FlowSpeedMin, flowSpeedMin);
             properties.SetFloat(Ids.FlowSpeedRange, flowSpeedRange);
             properties.SetFloat(Ids.FlowSheen, flowSheen);
+            properties.SetInt(Ids.MultiFluid, HasMixedLiquids ? 1 : 0);
         }
 
         /// <summary>
@@ -180,6 +200,11 @@ namespace HydroSandbox
         {
             public static readonly int Positions = Shader.PropertyToID("_Positions");
             public static readonly int Velocities = Shader.PropertyToID("_Velocities");
+            public static readonly int Composition = Shader.PropertyToID("_Composition");
+            public static readonly int MultiFluid = Shader.PropertyToID("_MultiFluid");
+            public static readonly int OpticsRadiusScale = Shader.PropertyToID("_OpticsRadiusScale");
+            public static readonly int LiquidAbsorption = Shader.PropertyToID("_LiquidAbsorption");
+            public static readonly int LiquidScattering = Shader.PropertyToID("_LiquidScattering");
             public static readonly int ParticleRadius = Shader.PropertyToID("_ParticleRadius");
             public static readonly int DepthRadiusScale = Shader.PropertyToID("_DepthRadiusScale");
             public static readonly int ThicknessScale = Shader.PropertyToID("_ThicknessScale");

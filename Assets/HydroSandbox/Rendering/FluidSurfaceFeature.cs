@@ -43,14 +43,18 @@ namespace HydroSandbox.Rendering
         const int CompositePass = 3;
         const int WhitewaterSplatPass = 4;
         const int WhitewaterCompositePass = 5;
+        const int OpticsPass = 6;
         const float NoFluidDepth = 1e6f;
 
         static readonly int SceneDepthId = Shader.PropertyToID("_SceneDepth");
         static readonly int SceneColorId = Shader.PropertyToID("_SceneColor");
         static readonly int FluidDepthId = Shader.PropertyToID("_FluidDepth");
         static readonly int FluidThicknessId = Shader.PropertyToID("_FluidThickness");
+        static readonly int FluidAbsorptionId = Shader.PropertyToID("_FluidAbsorption");
+        static readonly int FluidScatteringId = Shader.PropertyToID("_FluidScattering");
         static readonly int BlurSourceId = Shader.PropertyToID("_BlurSource");
         static readonly int BlurDirectionId = Shader.PropertyToID("_BlurDirection");
+        static readonly int BlurSpreadId = Shader.PropertyToID("_BlurSpread");
         static readonly int WhitewaterId = Shader.PropertyToID("_Whitewater");
 
         readonly MaterialPropertyBlock properties = new MaterialPropertyBlock();
@@ -66,9 +70,13 @@ namespace HydroSandbox.Rendering
             internal TextureHandle sceneColor;
             internal TextureHandle fluidDepth;
             internal TextureHandle fluidThickness;
+            internal TextureHandle fluidAbsorption;
+            internal TextureHandle fluidScattering;
+            internal bool mixed;
             internal TextureHandle blurSource;
             internal TextureHandle whitewater;
             internal Vector2 blurDirection;
+            internal bool blurSpread;
         }
 
         public FluidSurfacePass()
@@ -143,11 +151,34 @@ namespace HydroSandbox.Rendering
                 });
             }
 
+            bool mixed = surface.HasMixedLiquids;
+            TextureHandle absorption = TextureHandle.nullHandle;
+            TextureHandle scattering = TextureHandle.nullHandle;
+            if (mixed)
+            {
+                absorption = CreateColor(renderGraph, width, height, GraphicsFormat.R16G16B16A16_SFloat, "_FluidAbsorption", Color.clear);
+                scattering = CreateColor(renderGraph, width, height, GraphicsFormat.R16G16B16A16_SFloat, "_FluidScattering", Color.clear);
+                using var builder = renderGraph.AddRasterRenderPass<PassData>("Fluid Optics", out var data, profilingSampler);
+                Fill(data, surface, material, instanceCount);
+                data.sceneDepth = resources.cameraDepthTexture;
+                builder.UseTexture(data.sceneDepth, AccessFlags.Read);
+                builder.SetRenderAttachment(absorption, 0, AccessFlags.Write);
+                builder.SetRenderAttachment(scattering, 1, AccessFlags.Write);
+                builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
+                {
+                    d.properties.Clear();
+                    d.surface.SetOpticsProperties(d.properties);
+                    d.properties.SetTexture(SceneDepthId, d.sceneDepth);
+                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, OpticsPass, MeshTopology.Triangles, 6, d.instanceCount, d.properties);
+                });
+            }
+
             TextureHandle blurInput = fluidDepth;
             for (int i = 0; i < surface.BlurIterations; i++)
             {
-                AddBlurPass(renderGraph, surface, material, blurInput, blurTemp, new Vector2(1f / width, 0f), "Fluid Depth Blur H");
-                AddBlurPass(renderGraph, surface, material, blurTemp, blurred, new Vector2(0f, 1f / height), "Fluid Depth Blur V");
+                bool spread = i > 0;
+                AddBlurPass(renderGraph, surface, material, blurInput, blurTemp, new Vector2(1f / width, 0f), spread, "Fluid Depth Blur H");
+                AddBlurPass(renderGraph, surface, material, blurTemp, blurred, new Vector2(0f, 1f / height), spread, "Fluid Depth Blur V");
                 blurInput = blurred;
             }
 
@@ -158,6 +189,14 @@ namespace HydroSandbox.Rendering
                 data.sceneColor = resources.cameraOpaqueTexture;
                 data.fluidDepth = blurred;
                 data.fluidThickness = thickness;
+                data.mixed = mixed;
+                data.fluidAbsorption = absorption;
+                data.fluidScattering = scattering;
+                if (mixed)
+                {
+                    builder.UseTexture(absorption, AccessFlags.Read);
+                    builder.UseTexture(scattering, AccessFlags.Read);
+                }
                 builder.UseTexture(data.sceneDepth, AccessFlags.Read);
                 builder.UseTexture(data.sceneColor, AccessFlags.Read);
                 builder.UseTexture(data.fluidDepth, AccessFlags.Read);
@@ -171,6 +210,16 @@ namespace HydroSandbox.Rendering
                     d.properties.SetTexture(SceneColorId, d.sceneColor);
                     d.properties.SetTexture(FluidDepthId, d.fluidDepth);
                     d.properties.SetTexture(FluidThicknessId, d.fluidThickness);
+                    if (d.mixed)
+                    {
+                        d.properties.SetTexture(FluidAbsorptionId, d.fluidAbsorption);
+                        d.properties.SetTexture(FluidScatteringId, d.fluidScattering);
+                    }
+                    else
+                    {
+                        d.properties.SetTexture(FluidAbsorptionId, Texture2D.blackTexture);
+                        d.properties.SetTexture(FluidScatteringId, Texture2D.blackTexture);
+                    }
                     ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, CompositePass, MeshTopology.Triangles, 3, 1, d.properties);
                 });
             }
@@ -227,12 +276,13 @@ namespace HydroSandbox.Rendering
         }
 
         void AddBlurPass(RenderGraph renderGraph, FluidSurface surface, Material material, TextureHandle source,
-            TextureHandle destination, Vector2 direction, string name)
+            TextureHandle destination, Vector2 direction, bool spread, string name)
         {
             using var builder = renderGraph.AddRasterRenderPass<PassData>(name, out var data, profilingSampler);
             Fill(data, surface, material, 0);
             data.blurSource = source;
             data.blurDirection = direction;
+            data.blurSpread = spread;
             builder.UseTexture(source, AccessFlags.Read);
             builder.SetRenderAttachment(destination, 0, AccessFlags.Write);
             builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
@@ -241,6 +291,7 @@ namespace HydroSandbox.Rendering
                 d.surface.SetBlurProperties(d.properties);
                 d.properties.SetTexture(BlurSourceId, d.blurSource);
                 d.properties.SetVector(BlurDirectionId, d.blurDirection);
+                d.properties.SetFloat(BlurSpreadId, d.blurSpread ? 1f : 0f);
                 ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, BlurPass, MeshTopology.Triangles, 3, 1, d.properties);
             });
         }

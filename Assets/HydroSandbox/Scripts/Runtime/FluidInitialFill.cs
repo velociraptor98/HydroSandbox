@@ -11,5 +11,8 @@ namespace HydroSandbox
     {
         /// <summary>Appends initial particle positions (and optionally velocities) on a lattice of the given spacing.</summary>
         public abstract void Generate(float spacing, List<Vector3> positions, List<Vector3> velocities);
+
+        /// <summary>Optionally appends the liquid index (see <see cref="FluidMixing"/>) of each generated position; unassigned particles are liquid 0.</summary>
+        public virtual void AssignLiquids(List<Vector3> positions, List<int> liquids) { }
     }
 }

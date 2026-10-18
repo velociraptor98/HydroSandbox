@@ -29,6 +29,17 @@ float _Viscosity;
 float3 _ContainerMin;
 float3 _ContainerMax;
 
+// Multi-liquid mixing (FluidMixing). Each particle's composition (float4) holds the fraction of
+// each liquid; per-liquid properties are float4s blended with dot(composition, property), and
+// pair properties are symmetric matrices evaluated as dot(ci, mul(M, cj)).
+uint _MultiFluid;
+float4 _LiquidDensity;
+float4 _LiquidViscosity;
+float4 _LiquidWallFriction;
+float _BuoyancyScale;
+float4x4 _PairDiffusion;
+float4x4 _PairTension;
+
 // _ParticleCount is the pool capacity. _FluidState[0] is the live count: after every sort the
 // live particles occupy [0, count) and the dead are packed behind them. Liveness itself is
 // position.w (1 alive, 0 dead), which every kernel writing a position must preserve.

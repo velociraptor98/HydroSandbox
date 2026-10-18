@@ -13,8 +13,11 @@ namespace HydroSandbox
         [Tooltip("1000 rests particles on a cubic lattice at 2x radius spacing; higher values pack them tighter.")]
         [Range(500f, 2000f)] public float restDensity = 1000f;
 
-        [Tooltip("XSPH viscosity: how far each velocity is pulled toward its neighborhood average per substep.")]
-        [Range(0f, 1f)] public float viscosity = 0.05f;
+        [Tooltip("XSPH viscosity: how far each velocity is pulled toward its neighborhood average per substep. Applied several hundred times a second, so water wants about 0.01; 0.05 already reads as syrup.")]
+        [Range(0f, 1f)] public float viscosity = 0.01f;
+
+        [Tooltip("Vorticity confinement: spins eddies back up that XSPH and the density solve damp away, so water stays lively instead of syrupy. Per substep, like viscosity (applied once per frame at the summed strength). Above about 0.08 it feeds on the eddies it creates and the water never settles.")]
+        [Range(0f, 1f)] public float vorticityConfinement = 0.04f;
 
         public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
 

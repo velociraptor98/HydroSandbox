@@ -5,6 +5,10 @@
 //   3 Composite          normals from depth, refraction, Fresnel reflection, absorption
 //   4 WhitewaterSplat    soft splats of spray/foam/bubble particles: visible (R), submerged (G)
 //   5 WhitewaterComposite  lights the accumulated whitewater and blends it over the water
+//   6 ParticleOptics     multi-liquid only: additive absorption and scattering optical depth
+//                        (chord x each particle's composition-blended coefficients), RGB each.
+//                        Splats are _OpticsRadiusScale times wider and 1/scale^3 as dense, which
+//                        keeps the optical depth but smooths the particle grain out of the color.
 Shader "HydroSandbox/FluidSurface"
 {
     SubShader
@@ -35,7 +39,16 @@ Shader "HydroSandbox/FluidSurface"
         TEXTURE2D(_SceneColor);
         TEXTURE2D(_FluidDepth);
         TEXTURE2D(_FluidThickness);
+        TEXTURE2D(_FluidAbsorption);
+        TEXTURE2D(_FluidScattering);
         TEXTURE2D(_BlurSource);
+
+        // Multi-liquid (FluidMixing): per-particle liquid fractions and per-liquid optics.
+        uint _MultiFluid;
+        float _OpticsRadiusScale;
+        StructuredBuffer<float4> _Composition;
+        float4 _LiquidAbsorption[4];
+        float4 _LiquidScattering[4];
 
         float SceneEyeDepth(float2 uv)
         {
@@ -180,7 +193,17 @@ Shader "HydroSandbox/FluidSurface"
             float2 _BlurDirection;      // one texel along the blur axis, in UV
             float _BlurWorldRadius;     // filter radius in world units, projected per pixel
             float _BlurDepthFalloff;    // deviation (m) from the local surface plane at which a tap's weight falls to e^-1
-            int _BlurMaxRadius;         // pixel clamp
+            int _BlurMaxRadius;         // taps per side
+            float _BlurSpread;          // 1: spread taps over the full radius (iterations after the first)
+
+            // Off-screen reads count as no fluid: clamped, they would repeat the border pixel and
+            // smear it into stripes.
+            float BlurTap(float2 uv)
+            {
+                if (any(uv < 0.0) || any(uv > 1.0))
+                    return NO_FLUID_DEPTH;
+                return SAMPLE_TEXTURE2D_LOD(_BlurSource, sampler_PointClamp, uv, 0).r;
+            }
 
             float Frag(FullscreenVaryings i) : SV_Target
             {
@@ -192,7 +215,15 @@ Shader "HydroSandbox/FluidSurface"
                 // Pixels covered by the world-space radius at this depth. abs(): the projection's
                 // y scale is negative when URP flips rendering into a texture.
                 float pixelRadius = _BlurWorldRadius * abs(UNITY_MATRIX_P._m11) * 0.5 * _ScaledScreenParams.y / center;
+                // Close up the radius outgrows the tap budget. Clamping it would shrink the filter
+                // below one particle and leave every sphere cap showing as a bump, so later
+                // iterations spread their taps instead: the filter keeps its world size at any zoom
+                // for the same cost. Spread taps skip pixels, so they are only valid on depth the
+                // first (dense) iteration has already smoothed: on raw depth the creases between
+                // sphere caps alias into streaks, as does what detail remains once taps are more
+                // than about 4 pixels apart. Beyond that, extreme close-ups get a smaller filter.
                 int radius = clamp((int)pixelRadius, 1, _BlurMaxRadius);
+                float2 tapStep = _BlurDirection * (_BlurSpread > 0.5 ? clamp(pixelRadius / radius, 1.0, 4.0) : 1.0);
                 float sigma = max(radius * 0.5, 1.0);
                 float invTwoSigma2 = 0.5 / (sigma * sigma);
                 float invFalloff2 = rcp(_BlurDepthFalloff * _BlurDepthFalloff);
@@ -203,8 +234,8 @@ Shader "HydroSandbox/FluidSurface"
                 // slope is the gentler one-sided difference, so silhouettes still stop the blur. It
                 // is measured over half the radius so it follows the surface, not one particle's cap.
                 int stride = max(radius >> 1, 1);
-                float dPrev = SAMPLE_TEXTURE2D_LOD(_BlurSource, sampler_PointClamp, uv - _BlurDirection * stride, 0).r;
-                float dNext = SAMPLE_TEXTURE2D_LOD(_BlurSource, sampler_PointClamp, uv + _BlurDirection * stride, 0).r;
+                float dPrev = BlurTap(uv - tapStep * stride);
+                float dNext = BlurTap(uv + tapStep * stride);
                 float slopePrev = dPrev < NO_FLUID_DEPTH ? (center - dPrev) / stride : 1e6;
                 float slopeNext = dNext < NO_FLUID_DEPTH ? (dNext - center) / stride : 1e6;
                 float slope = abs(slopePrev) < abs(slopeNext) ? slopePrev : slopeNext;
@@ -216,9 +247,16 @@ Shader "HydroSandbox/FluidSurface"
                 {
                     if (k == 0)
                         continue;
-                    float d = SAMPLE_TEXTURE2D_LOD(_BlurSource, sampler_PointClamp, uv + _BlurDirection * k, 0).r;
+                    float d = BlurTap(uv + tapStep * k);
+                    // Spread taps cross the water's edge one every few pixels; dropping each one
+                    // as it leaves the water turns the edge band into a staircase that the normals
+                    // show as stripes. Off the edge they count as the local surface plane instead.
                     if (d >= NO_FLUID_DEPTH)
-                        continue;
+                    {
+                        if (_BlurSpread < 0.5)
+                            continue;
+                        d = center + slope * k;
+                    }
                     float dz = d - (center + slope * k);
                     float w = exp(-k * k * invTwoSigma2 - dz * dz * invFalloff2);
                     sum += d * w;
@@ -258,22 +296,29 @@ Shader "HydroSandbox/FluidSurface"
                 return WorldPositionFromEyeDepth(uv, SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r);
             }
 
-            // Uses whichever neighbor is closer in depth on each axis, so silhouettes do not
-            // smear normals across the depth discontinuity.
+            // Central differences, except across a depth discontinuity (a silhouette), where the
+            // neighbor closer in depth is used so normals do not smear across it. Choosing the
+            // closer neighbor everywhere flips between forward and backward differences from
+            // pixel to pixel on smooth water, which shows as a crosshatch.
+            // Differences span two pixels: refraction turns sub-pixel normal noise into visible
+            // shimmer on a detailed bed, and a wider stencil averages it out.
             float3 ReconstructNormal(float2 uv, float3 center, float eyeDepth)
             {
-                float2 texel = rcp(_ScaledScreenParams.xy);
+                float2 texel = 2.0 * rcp(_ScaledScreenParams.xy);
                 float dR = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv + float2(texel.x, 0), 0).r;
                 float dL = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv - float2(texel.x, 0), 0).r;
                 float dU = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv + float2(0, texel.y), 0).r;
                 float dD = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv - float2(0, texel.y), 0).r;
 
-                float3 ddx = abs(dR - eyeDepth) < abs(dL - eyeDepth)
-                    ? WorldPositionFromEyeDepth(uv + float2(texel.x, 0), dR) - center
-                    : center - WorldPositionFromEyeDepth(uv - float2(texel.x, 0), dL);
-                float3 ddy = abs(dU - eyeDepth) < abs(dD - eyeDepth)
-                    ? WorldPositionFromEyeDepth(uv + float2(0, texel.y), dU) - center
-                    : center - WorldPositionFromEyeDepth(uv - float2(0, texel.y), dD);
+                float3 right = WorldPositionFromEyeDepth(uv + float2(texel.x, 0), dR);
+                float3 left = WorldPositionFromEyeDepth(uv - float2(texel.x, 0), dL);
+                float3 up = WorldPositionFromEyeDepth(uv + float2(0, texel.y), dU);
+                float3 down = WorldPositionFromEyeDepth(uv - float2(0, texel.y), dD);
+                float jump = 2.0 * _ParticleRadius;
+                float3 ddx = max(abs(dR - eyeDepth), abs(dL - eyeDepth)) < jump ? 0.5 * (right - left)
+                    : abs(dR - eyeDepth) < abs(dL - eyeDepth) ? right - center : center - left;
+                float3 ddy = max(abs(dU - eyeDepth), abs(dD - eyeDepth)) < jump ? 0.5 * (up - down)
+                    : abs(dU - eyeDepth) < abs(dD - eyeDepth) ? up - center : center - down;
 
                 float3 n = normalize(cross(ddy, ddx));
                 float3 toCamera = GetWorldSpaceViewDir(center);
@@ -301,11 +346,33 @@ Shader "HydroSandbox/FluidSurface"
                 return normalize(n + perturb * (0.5 * strength));
             }
 
+            // Beer-Lambert absorption plus in-scattered light along the same path. One liquid uses
+            // the surface's uniform coefficients; mixed liquids use the accumulated optical depths,
+            // whose scattering share sets the color of the in-scattered light.
+            float3 Transmit(float2 uv, float3 background, float thickness, float3 ambient)
+            {
+                if (_MultiFluid == 0)
+                {
+                    float3 transmittance = exp(-_AbsorptionCoefficients.rgb * thickness);
+                    return background * transmittance + _ScatterColor.rgb * ambient * (1.0 - transmittance);
+                }
+                float3 absorbed = SAMPLE_TEXTURE2D_LOD(_FluidAbsorption, sampler_LinearClamp, uv, 0).rgb;
+                float3 scattered = SAMPLE_TEXTURE2D_LOD(_FluidScattering, sampler_LinearClamp, uv, 0).rgb;
+                float3 extinction = absorbed + scattered;
+                float3 transmittance = exp(-extinction);
+                float3 albedo = scattered / max(extinction, 1e-4);
+                float3 light = ambient + GetMainLight().color * 0.35;
+                return background * transmittance + albedo * light * (1.0 - transmittance);
+            }
+
             float4 Frag(FullscreenVaryings i) : SV_Target
             {
                 float2 uv = GetNormalizedScreenSpaceUV(i.positionCS);
                 float eyeDepth = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r;
-                if (eyeDepth >= NO_FLUID_DEPTH || eyeDepth > SceneEyeDepth(uv))
+                // Thin water lying on the bed is nearly coplanar with it; a strict depth test flips
+                // pixel to pixel there into a moire, so water up to a particle radius behind the
+                // scene still shows.
+                if (eyeDepth >= NO_FLUID_DEPTH || eyeDepth > SceneEyeDepth(uv) + _ParticleRadius)
                     discard;
 
                 float2 thicknessSpeed = SAMPLE_TEXTURE2D_LOD(_FluidThickness, sampler_LinearClamp, uv, 0).rg;
@@ -329,10 +396,8 @@ Shader "HydroSandbox/FluidSurface"
                     refractUV = uv;
                 float3 background = SAMPLE_TEXTURE2D_LOD(_SceneColor, sampler_LinearClamp, refractUV, 0).rgb;
 
-                // Beer-Lambert absorption plus in-scattered ambient light along the same path.
-                float3 transmittance = exp(-_AbsorptionCoefficients.rgb * thickness);
                 float3 ambient = SampleAmbient(n);
-                float3 transmitted = background * transmittance + _ScatterColor.rgb * ambient * (1.0 - transmittance);
+                float3 transmitted = Transmit(uv, background, thickness, ambient);
                 transmitted = lerp(transmitted, ambient, flow * _FlowSheen);
 
                 float3 r = reflect(-v, n);
@@ -500,6 +565,65 @@ Shader "HydroSandbox/FluidSurface"
                 float3 bubbleLit = lit * lerp(float3(1, 1, 1), _ScatterColor.rgb * 3.0, 0.4);
                 float3 color = (lit * visible + bubbleLit * submerged * (1.0 - visible)) / alpha;
                 return float4(color, alpha);
+            }
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "ParticleOptics"
+            ZTest Always
+            Blend One One
+
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment Frag
+
+            struct OpticsVaryings
+            {
+                float4 positionCS : SV_POSITION;
+                float2 corner : TEXCOORD0;
+                float3 centerVS : TEXCOORD1;
+                float radius : TEXCOORD2;
+                float3 absorption : TEXCOORD3;
+                float3 scattering : TEXCOORD4;
+            };
+
+            struct OpticsTargets
+            {
+                float4 absorption : SV_Target0;
+                float4 scattering : SV_Target1;
+            };
+
+            OpticsVaryings Vert(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
+            {
+                ParticleVaryings p = ParticleVert(vertexId, instanceId, _OpticsRadiusScale);
+                OpticsVaryings o;
+                o.positionCS = p.positionCS;
+                o.corner = p.corner;
+                o.centerVS = p.centerVS;
+                o.radius = p.radius;
+                float4 c = _Composition[instanceId];
+                o.absorption = c.x * _LiquidAbsorption[0].rgb + c.y * _LiquidAbsorption[1].rgb
+                             + c.z * _LiquidAbsorption[2].rgb + c.w * _LiquidAbsorption[3].rgb;
+                o.scattering = c.x * _LiquidScattering[0].rgb + c.y * _LiquidScattering[1].rgb
+                             + c.z * _LiquidScattering[2].rgb + c.w * _LiquidScattering[3].rgb;
+                return o;
+            }
+
+            OpticsTargets Frag(OpticsVaryings i)
+            {
+                float r2 = dot(i.corner, i.corner);
+                clip(1.0 - r2);
+                float z = sqrt(1.0 - r2);
+                float frontEyeDepth = -(i.centerVS.z + z * i.radius);
+                float2 uv = GetNormalizedScreenSpaceUV(i.positionCS);
+                clip(SceneEyeDepth(uv) - frontEyeDepth);
+                float chord = 2.0 * z * i.radius * _ThicknessScale / (_OpticsRadiusScale * _OpticsRadiusScale * _OpticsRadiusScale);
+                OpticsTargets o;
+                o.absorption = float4(chord * i.absorption, 0);
+                o.scattering = float4(chord * i.scattering, 0);
+                return o;
             }
             ENDHLSL
         }

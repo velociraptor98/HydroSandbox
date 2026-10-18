@@ -104,7 +104,8 @@ namespace HydroSandbox
             s.solverIterations = IntSlider("Iterations", s.solverIterations, 1, 8);
             s.particleRadius = Slider("Particle radius", s.particleRadius, 0.005f, 0.1f, "F3");
             s.restDensity = Slider("Rest density", s.restDensity, 500f, 2000f, "F0");
-            s.viscosity = Slider("Viscosity", s.viscosity, 0f, 1f, "F2");
+            s.viscosity = Slider("Viscosity", s.viscosity, 0f, 0.2f, "F3");
+            s.vorticityConfinement = Slider("Vorticity confinement", s.vorticityConfinement, 0f, 1f, "F2");
             s.gravity.y = Slider("Gravity Y", s.gravity.y, -20f, 0f, "F2");
 
             GUILayout.BeginHorizontal();

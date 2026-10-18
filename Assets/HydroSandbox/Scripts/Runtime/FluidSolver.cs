@@ -54,8 +54,8 @@ namespace HydroSandbox
         GraphicsBuffer positions, positionsAlt;
         GraphicsBuffer predicted, predictedAlt;
         GraphicsBuffer velocities, velocitiesAlt;
-        GraphicsBuffer fluidType, fluidTypeAlt;
-        GraphicsBuffer density, lambda, deltaPosition;
+        GraphicsBuffer composition, compositionAlt;
+        GraphicsBuffer density, lambda, deltaPosition, vorticity;
         GraphicsBuffer particleCell, sortedCellId;
         GraphicsBuffer cellCount, cellStart;
         GraphicsBuffer neighborList, neighborCount;
@@ -66,6 +66,7 @@ namespace HydroSandbox
         readonly List<GraphicsBuffer> scanBlockOffsets = new List<GraphicsBuffer>();
 
         FluidRigidbodyCoupling coupling;
+        FluidMixing mixing;
         int poolSize;
         int hashTableSize;
         int bufferGeneration;
@@ -87,8 +88,8 @@ namespace HydroSandbox
         int neighborListKernel;
         int sinkKernel, spawnKernel;
         int lambdaKernel, deltaKernel, applyDeltaKernel;
-        int containerKernel, collidersKernel, terrainKernel;
-        int updateVelocityKernel, viscosityKernel;
+        int containerKernel, collidersKernel, terrainKernel, tankKernel;
+        int updateVelocityKernel, vorticityKernel, viscosityKernel;
 
         float cachedMassSmoothing = -1f, cachedMassSpacing = -1f, cachedMass;
 
@@ -102,6 +103,9 @@ namespace HydroSandbox
         public float ParticleRadius => settings.particleRadius;
         public GraphicsBuffer PositionBuffer => positions;
         public GraphicsBuffer VelocityBuffer => velocities;
+        /// <summary>Per-particle liquid fractions (float4), meaningful when a <see cref="FluidMixing"/> is present.</summary>
+        public GraphicsBuffer CompositionBuffer => composition;
+        public FluidMixing Mixing => mixing;
 
         // Last substep's sorted state, for passes that run after the solve (whitewater).
         internal GraphicsBuffer FluidStateBuffer => fluidState;
@@ -190,13 +194,14 @@ namespace HydroSandbox
 
             int substeps = Mathf.Max(1, settings.substeps);
             coupling = TryGetComponent(out FluidRigidbodyCoupling c) && c.isActiveAndEnabled ? c : null;
+            mixing = TryGetComponent(out FluidMixing m) && m.isActiveAndEnabled ? m : null;
             cmd.Clear();
             cmd.BeginSample(solveSampler);
             PushParameters(settings.timeStep / substeps);
             RecordEmission(settings.timeStep);
             RecordColliderSetup();
             for (int i = 0; i < substeps; i++)
-                RecordSubstep();
+                RecordSubstep(i == substeps - 1);
             coupling?.Record(cmd, this);
             if (TryGetComponent(out FluidWhitewater whitewater) && whitewater.isActiveAndEnabled)
                 whitewater.Record(cmd, this, settings.timeStep, frameIndex);
@@ -234,7 +239,9 @@ namespace HydroSandbox
             containerKernel = collisionShader.FindKernel("ResolveContainer");
             collidersKernel = collisionShader.FindKernel("ResolveColliders");
             terrainKernel = collisionShader.FindKernel("ResolveTerrain");
+            tankKernel = collisionShader.FindKernel("ResolveTank");
             updateVelocityKernel = velocityShader.FindKernel("UpdateVelocity");
+            vorticityKernel = velocityShader.FindKernel("ComputeVorticity");
             viscosityKernel = velocityShader.FindKernel("ApplyViscosity");
             sinkKernel = emissionShader.FindKernel("ApplySinks");
             spawnKernel = emissionShader.FindKernel("SpawnParticles");
@@ -258,11 +265,12 @@ namespace HydroSandbox
             predictedAlt = CreateBuffer(poolSize, 16);
             velocities = CreateBuffer(poolSize, 16);
             velocitiesAlt = CreateBuffer(poolSize, 16);
-            fluidType = CreateBuffer(poolSize, 4);
-            fluidTypeAlt = CreateBuffer(poolSize, 4);
+            composition = CreateBuffer(poolSize, 16);
+            compositionAlt = CreateBuffer(poolSize, 16);
             density = CreateBuffer(poolSize, 4);
             lambda = CreateBuffer(poolSize, 4);
             deltaPosition = CreateBuffer(poolSize, 16);
+            vorticity = CreateBuffer(poolSize, 16);
             particleCell = CreateBuffer(poolSize, 8);
             sortedCellId = CreateBuffer(poolSize, 4);
             // One extra bucket past the table collects dead particles.
@@ -295,14 +303,14 @@ namespace HydroSandbox
             foreach (var buffer in new[]
                      {
                          positions, positionsAlt, predicted, predictedAlt, velocities, velocitiesAlt,
-                         fluidType, fluidTypeAlt, density, lambda, deltaPosition,
+                         composition, compositionAlt, density, lambda, deltaPosition, vorticity,
                          particleCell, sortedCellId, cellCount, cellStart, neighborList, neighborCount,
                          fluidState, sinkRecords, sinkCounters, spawnLayers, spawnPattern,
                          colliderRecords
                      })
                 buffer?.Release();
             positions = positionsAlt = predicted = predictedAlt = velocities = velocitiesAlt = null;
-            fluidType = fluidTypeAlt = density = lambda = deltaPosition = null;
+            composition = compositionAlt = density = lambda = deltaPosition = vorticity = null;
             particleCell = sortedCellId = cellCount = cellStart = neighborList = neighborCount = null;
             fluidState = sinkRecords = sinkCounters = spawnLayers = spawnPattern = null;
             colliderRecords = null;
@@ -360,7 +368,7 @@ namespace HydroSandbox
 
             System.Array.Clear(data, 0, data.Length);
             velocities.SetData(data);
-            fluidType.SetData(new uint[poolSize]);
+            UploadComposition(initial);
             fluidState.SetData(new uint[] { (uint)initial, 0, 0, 0 });
             AliveCount = initial;
         }
@@ -385,9 +393,23 @@ namespace HydroSandbox
             positions.SetData(data);
             predicted.SetData(data);
             velocities.SetData(velocityData);
-            fluidType.SetData(new uint[poolSize]);
+            var liquids = new List<int>();
+            fill.AssignLiquids(points, liquids);
+            UploadComposition(initial, liquids);
             fluidState.SetData(new uint[] { (uint)initial, 0, 0, 0 });
             AliveCount = initial;
+        }
+
+        // Every initial particle starts as liquid 0 unless the fill says otherwise.
+        void UploadComposition(int initial, List<int> liquids = null)
+        {
+            var data = new Vector4[poolSize];
+            for (int i = 0; i < poolSize; i++)
+            {
+                int liquid = liquids != null && i < initial && i < liquids.Count ? Mathf.Clamp(liquids[i], 0, FluidMixing.MaxLiquids - 1) : 0;
+                data[i][liquid] = 1f;
+            }
+            composition.SetData(data);
         }
 
         // Mass is chosen so a cubic lattice at 2r spacing evaluates to ReferenceDensity, which
@@ -453,8 +475,21 @@ namespace HydroSandbox
             cmd.SetComputeFloatParam(cs, Ids.SCorrK, settings.artificialPressure * h2);
             cmd.SetComputeFloatParam(cs, Ids.SCorrInvWdq, 1f / wDeltaQ);
             cmd.SetComputeFloatParam(cs, Ids.Viscosity, settings.viscosity);
+            cmd.SetComputeFloatParam(cs, Ids.VorticityConfinement, settings.vorticityConfinement);
             cmd.SetComputeVectorParam(cs, Ids.ContainerMin, container.min + inset);
             cmd.SetComputeVectorParam(cs, Ids.ContainerMax, container.max - inset);
+
+            cmd.SetComputeIntParam(cs, Ids.MultiFluid, mixing != null ? 1 : 0);
+            if (mixing != null)
+            {
+                mixing.BuildPairMatrices(out Matrix4x4 diffusion, out Matrix4x4 tension);
+                cmd.SetComputeVectorParam(cs, Ids.LiquidDensity, mixing.Densities);
+                cmd.SetComputeVectorParam(cs, Ids.LiquidViscosity, mixing.Viscosities);
+                cmd.SetComputeVectorParam(cs, Ids.LiquidWallFriction, mixing.WallFrictions);
+                cmd.SetComputeFloatParam(cs, Ids.BuoyancyScale, mixing.BuoyancyScale);
+                cmd.SetComputeMatrixParam(cs, Ids.PairDiffusion, diffusion);
+                cmd.SetComputeMatrixParam(cs, Ids.PairTension, tension);
+            }
         }
 
         /// <summary>Uploads this frame's collider records and terrain parameters.</summary>
@@ -483,12 +518,25 @@ namespace HydroSandbox
                 cmd.SetComputeVectorParam(cs, Ids.TerrainSize, terrain.Size);
                 cmd.SetComputeFloatParam(cs, Ids.TerrainFriction, terrain.Friction);
             }
+
+            var tank = FluidTank.Active;
+            if (tank != null && tank.HoleBuffer != null)
+            {
+                Bounds interior = tank.Interior;
+                cmd.SetComputeVectorParam(cs, Ids.TankMin, interior.min);
+                cmd.SetComputeVectorParam(cs, Ids.TankMax, interior.max);
+                cmd.SetComputeFloatParam(cs, Ids.TankWall, tank.WallThickness);
+                cmd.SetComputeIntParam(cs, Ids.TankHoleCount, tank.HoleCount);
+                tank.UploadHoles(cmd);
+            }
         }
 
         void RecordCollisions()
         {
             var cs = collisionShader;
             cmd.SetComputeBufferParam(cs, containerKernel, Ids.Predicted, predicted);
+            cmd.SetComputeBufferParam(cs, containerKernel, Ids.Positions, positions);
+            cmd.SetComputeBufferParam(cs, containerKernel, Ids.Composition, composition);
             DispatchParticles(cs, containerKernel);
 
             var terrain = FluidTerrainCollider.ActiveTerrain;
@@ -506,6 +554,16 @@ namespace HydroSandbox
                 cmd.SetComputeBufferParam(cs, collidersKernel, Ids.Positions, positions);
                 cmd.SetComputeBufferParam(cs, collidersKernel, Ids.Colliders, colliderRecords);
                 DispatchParticles(cs, collidersKernel);
+            }
+
+            var tank = FluidTank.Active;
+            if (tank != null && tank.HoleBuffer != null)
+            {
+                cmd.SetComputeBufferParam(cs, tankKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(cs, tankKernel, Ids.Positions, positions);
+                cmd.SetComputeBufferParam(cs, tankKernel, Ids.Composition, composition);
+                cmd.SetComputeBufferParam(cs, tankKernel, Ids.TankHoles, tank.HoleBuffer);
+                DispatchParticles(cs, tankKernel);
             }
         }
 
@@ -562,12 +620,12 @@ namespace HydroSandbox
                 cmd.SetComputeBufferParam(es, spawnKernel, Ids.Positions, positions);
                 cmd.SetComputeBufferParam(es, spawnKernel, Ids.Predicted, predicted);
                 cmd.SetComputeBufferParam(es, spawnKernel, Ids.Velocities, velocities);
-                cmd.SetComputeBufferParam(es, spawnKernel, Ids.FluidType, fluidType);
+                cmd.SetComputeBufferParam(es, spawnKernel, Ids.Composition, composition);
                 cmd.DispatchCompute(es, spawnKernel, Groups(pointCount, ThreadGroupSize), 1, 1);
             }
         }
 
-        void RecordSubstep()
+        void RecordSubstep(bool lastSubstep)
         {
             var ps = predictShader;
             cmd.SetComputeBufferParam(ps, predictKernel, Ids.Positions, positions);
@@ -614,13 +672,32 @@ namespace HydroSandbox
             cmd.SetComputeBufferParam(vs, updateVelocityKernel, Ids.Velocities, velocities);
             DispatchParticles(vs, updateVelocityKernel);
 
+            // Confinement only has to keep eddies alive from frame to frame, so its extra neighbor
+            // pass (the curl) runs on the last substep only, with the whole frame's strength.
+            bool confine = lastSubstep && settings.vorticityConfinement > 0f;
+            cmd.SetComputeFloatParam(vs, Ids.VorticityConfinement, confine ? settings.vorticityConfinement * Mathf.Max(1, settings.substeps) : 0f);
+            if (confine)
+            {
+                BindNeighborList(vs, vorticityKernel);
+                cmd.SetComputeBufferParam(vs, vorticityKernel, Ids.FluidState, fluidState);
+                cmd.SetComputeBufferParam(vs, vorticityKernel, Ids.Predicted, predicted);
+                cmd.SetComputeBufferParam(vs, vorticityKernel, Ids.Velocities, velocities);
+                cmd.SetComputeBufferParam(vs, vorticityKernel, Ids.Vorticity, vorticity);
+                DispatchParticles(vs, vorticityKernel);
+            }
+
             BindNeighborList(vs, viscosityKernel);
+            cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.VorticityIn, vorticity);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.FluidState, fluidState);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.Velocities, velocities);
             cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.VelocitiesOut, velocitiesAlt);
+            cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.Composition, composition);
+            cmd.SetComputeBufferParam(vs, viscosityKernel, Ids.CompositionOut, compositionAlt);
             DispatchParticles(vs, viscosityKernel);
             Swap(ref velocities, ref velocitiesAlt);
+            if (mixing != null)
+                Swap(ref composition, ref compositionAlt);
         }
 
         void RecordNeighborSearch()
@@ -646,18 +723,18 @@ namespace HydroSandbox
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.Positions, positions);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.Predicted, predicted);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.Velocities, velocities);
-            cmd.SetComputeBufferParam(ns, reorderKernel, Ids.FluidType, fluidType);
+            cmd.SetComputeBufferParam(ns, reorderKernel, Ids.Composition, composition);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.PositionsOut, positionsAlt);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.PredictedOut, predictedAlt);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.VelocitiesOut, velocitiesAlt);
-            cmd.SetComputeBufferParam(ns, reorderKernel, Ids.FluidTypeOut, fluidTypeAlt);
+            cmd.SetComputeBufferParam(ns, reorderKernel, Ids.CompositionOut, compositionAlt);
             cmd.SetComputeBufferParam(ns, reorderKernel, Ids.SortedCellId, sortedCellId);
             DispatchParticles(ns, reorderKernel);
 
             Swap(ref positions, ref positionsAlt);
             Swap(ref predicted, ref predictedAlt);
             Swap(ref velocities, ref velocitiesAlt);
-            Swap(ref fluidType, ref fluidTypeAlt);
+            Swap(ref composition, ref compositionAlt);
         }
 
         void RecordNeighborList()
@@ -736,8 +813,18 @@ namespace HydroSandbox
             public static readonly int SCorrK = Shader.PropertyToID("_SCorrK");
             public static readonly int SCorrInvWdq = Shader.PropertyToID("_SCorrInvWdq");
             public static readonly int Viscosity = Shader.PropertyToID("_Viscosity");
+            public static readonly int VorticityConfinement = Shader.PropertyToID("_VorticityConfinement");
+            public static readonly int Vorticity = Shader.PropertyToID("_Vorticity");
+            public static readonly int VorticityIn = Shader.PropertyToID("_VorticityIn");
             public static readonly int ContainerMin = Shader.PropertyToID("_ContainerMin");
             public static readonly int ContainerMax = Shader.PropertyToID("_ContainerMax");
+            public static readonly int MultiFluid = Shader.PropertyToID("_MultiFluid");
+            public static readonly int LiquidDensity = Shader.PropertyToID("_LiquidDensity");
+            public static readonly int LiquidViscosity = Shader.PropertyToID("_LiquidViscosity");
+            public static readonly int LiquidWallFriction = Shader.PropertyToID("_LiquidWallFriction");
+            public static readonly int BuoyancyScale = Shader.PropertyToID("_BuoyancyScale");
+            public static readonly int PairDiffusion = Shader.PropertyToID("_PairDiffusion");
+            public static readonly int PairTension = Shader.PropertyToID("_PairTension");
 
             public static readonly int Positions = Shader.PropertyToID("_Positions");
             public static readonly int PositionsOut = Shader.PropertyToID("_PositionsOut");
@@ -745,8 +832,8 @@ namespace HydroSandbox
             public static readonly int PredictedOut = Shader.PropertyToID("_PredictedOut");
             public static readonly int Velocities = Shader.PropertyToID("_Velocities");
             public static readonly int VelocitiesOut = Shader.PropertyToID("_VelocitiesOut");
-            public static readonly int FluidType = Shader.PropertyToID("_FluidType");
-            public static readonly int FluidTypeOut = Shader.PropertyToID("_FluidTypeOut");
+            public static readonly int Composition = Shader.PropertyToID("_Composition");
+            public static readonly int CompositionOut = Shader.PropertyToID("_CompositionOut");
             public static readonly int Density = Shader.PropertyToID("_Density");
             public static readonly int Lambda = Shader.PropertyToID("_Lambda");
             public static readonly int DeltaPosition = Shader.PropertyToID("_DeltaPosition");
@@ -779,6 +866,11 @@ namespace HydroSandbox
             public static readonly int TerrainSize = Shader.PropertyToID("_TerrainSize");
             public static readonly int TerrainResolution = Shader.PropertyToID("_TerrainResolution");
             public static readonly int TerrainFriction = Shader.PropertyToID("_TerrainFriction");
+            public static readonly int TankMin = Shader.PropertyToID("_TankMin");
+            public static readonly int TankMax = Shader.PropertyToID("_TankMax");
+            public static readonly int TankWall = Shader.PropertyToID("_TankWall");
+            public static readonly int TankHoleCount = Shader.PropertyToID("_TankHoleCount");
+            public static readonly int TankHoles = Shader.PropertyToID("_TankHoles");
 
             public static readonly int ScanCount = Shader.PropertyToID("_ScanCount");
             public static readonly int ScanInput = Shader.PropertyToID("_ScanInput");
