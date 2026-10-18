@@ -43,6 +43,7 @@ float _EmitSpread;
 float2 _LifetimeRange;
 
 float _SprayDrag;
+float3 _Wind;          // spray drags toward the wind's velocity
 float _BubbleBuoyancy;
 float _BubbleDrag;
 uint _SprayMaxNeighbors;
@@ -191,7 +192,7 @@ void AdvectWhitewater(uint3 id : SV_DispatchThreadID)
     if (neighbors < _SprayMaxNeighbors)
     {
         type = TYPE_SPRAY;
-        v = (v + _Gravity * dt) * saturate(1.0 - _SprayDrag * dt);
+        v = _Wind + (v + _Gravity * dt - _Wind) * saturate(1.0 - _SprayDrag * dt);
         aging = 0.3;
     }
     else if (neighbors > _BubbleMinNeighbors)

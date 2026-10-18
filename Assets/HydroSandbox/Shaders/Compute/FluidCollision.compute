@@ -34,6 +34,8 @@ StructuredBuffer<float4> _Composition;
 
 uint _ColliderCount;
 StructuredBuffer<ColliderRecord> _Colliders;
+// Collider records hold the end-of-frame pose; this substep's end is this many seconds earlier.
+float _ColliderTimeOffset;
 float _ParticleRadius;
 
 // Heights normalized to [0, 1], row-major by z: index = z * resolution + x.
@@ -165,6 +167,9 @@ void ResolveColliders(uint3 id : SV_DispatchThreadID)
     for (uint k = 0; k < _ColliderCount; k++)
     {
         ColliderRecord c = _Colliders[k];
+        // A collider moving more than its own thickness in one frame would otherwise jump past
+        // the particles in its way and push them out of its far side.
+        c.center -= c.linearVelocity * _ColliderTimeOffset;
         float3 localNormal;
         float distance = ShapeDistance(c, InverseRotateVector(c.rotation, p - c.center), localNormal);
         if (distance >= _ParticleRadius)

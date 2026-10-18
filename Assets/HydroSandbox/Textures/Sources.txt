@@ -16,3 +16,4 @@ Sky/alps_field_2k               Poly Haven, https://polyhaven.com/a/alps_field (
 ../Models/DeadTreeTrunk02       Poly Haven, https://polyhaven.com/a/dead_tree_trunk_02 (CC0)
 Sky/photo_studio_loft_hall_2k  Poly Haven, https://polyhaven.com/a/photo_studio_loft_hall (CC0)
 Wood/wood_table_001_*          Poly Haven, https://polyhaven.com/a/wood_table_001 (CC0)
+Sky/kloppenheim_01_puresky_2k  Poly Haven, https://polyhaven.com/a/kloppenheim_01_puresky (CC0)

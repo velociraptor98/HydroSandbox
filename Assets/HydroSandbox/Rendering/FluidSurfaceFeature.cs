@@ -263,13 +263,19 @@ namespace HydroSandbox.Rendering
             {
                 Fill(data, surface, material, 0);
                 data.whitewater = whitewater;
+                data.sceneDepth = resources.cameraDepthTexture;
+                data.fluidDepth = fluidDepth;
                 builder.UseTexture(data.whitewater, AccessFlags.Read);
+                builder.UseTexture(data.sceneDepth, AccessFlags.Read);
+                builder.UseTexture(data.fluidDepth, AccessFlags.Read);
                 builder.SetRenderAttachment(resources.activeColorTexture, 0, AccessFlags.ReadWrite);
                 builder.SetRenderFunc(static (PassData d, RasterGraphContext ctx) =>
                 {
                     d.properties.Clear();
                     d.surface.SetWhitewaterCompositeProperties(d.properties);
                     d.properties.SetTexture(WhitewaterId, d.whitewater);
+                    d.properties.SetTexture(SceneDepthId, d.sceneDepth);
+                    d.properties.SetTexture(FluidDepthId, d.fluidDepth);
                     ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material, WhitewaterCompositePass, MeshTopology.Triangles, 3, 1, d.properties);
                 });
             }

@@ -7,8 +7,15 @@
 
 StructuredBuffer<float4> _Positions;
 StructuredBuffer<float4> _Velocities;
+StructuredBuffer<float4> _Composition;
 StructuredBuffer<float4> _SamplePoints;     // xyz world position
-RWStructuredBuffer<float4> _SampleResults;  // xyz fluid velocity, w density / rest density
+
+struct SampleResult
+{
+    float4 flow;        // xyz fluid velocity, w density / rest density
+    float4 liquid;      // x mass density of the liquid there (kg/m^3; 0 for single-liquid scenes), y viscosity
+};
+RWStructuredBuffer<SampleResult> _SampleResults;
 uint _SampleCount;
 
 [numthreads(64, 1, 1)]
@@ -21,6 +28,7 @@ void SampleFluid(uint3 id : SV_DispatchThreadID)
     float3 x = _SamplePoints[s].xyz;
     float densitySum = 0;
     float3 velocitySum = 0;
+    float4 compositionSum = 0;
     float weightSum = 0;
     FOR_EACH_GRID_NEIGHBOR(x, j)
         float3 r = x - _Positions[j].xyz;
@@ -30,10 +38,16 @@ void SampleFluid(uint3 id : SV_DispatchThreadID)
         float w = Poly6(r2);
         densitySum += w;
         velocitySum += _Velocities[j].xyz * w;
+        if (_MultiFluid != 0)
+            compositionSum += _Composition[j] * w;
         weightSum += w;
     END_FOR_EACH_GRID_NEIGHBOR
 
     float density = _ParticleMass * densitySum * _InvRestDensity;
     float3 velocity = weightSum > 0 ? velocitySum / weightSum : 0;
-    _SampleResults[s] = float4(velocity, density);
+    float4 composition = weightSum > 0 ? compositionSum / weightSum : 0;
+    SampleResult result;
+    result.flow = float4(velocity, density);
+    result.liquid = float4(dot(composition, _LiquidDensity), dot(composition, _LiquidViscosity), 0, 0);
+    _SampleResults[s] = result;
 }

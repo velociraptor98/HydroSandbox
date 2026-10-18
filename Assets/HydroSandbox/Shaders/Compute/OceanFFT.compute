@@ -1,0 +1,224 @@
+// Tessendorf FFT ocean, one cascade (a square patch that tiles) per dispatch set:
+// InitSpectrum (once) draws the initial amplitudes from a JONSWAP spectrum with directional
+// spreading; each frame TimeSpectrum advances them and builds the spectra of every field,
+// FFTRows/FFTColumns invert them, and Assemble writes the displacement, slope, foam and velocity
+// textures the ocean surface and the surf-zone forcing sample.
+//
+// Six inverse FFTs per cascade: each packs two real fields as A + iB, since the transform of a
+// Hermitian spectrum is real.
+
+#pragma kernel InitSpectrum
+#pragma kernel TimeSpectrum
+#pragma kernel FFTRows
+#pragma kernel FFTColumns
+#pragma kernel Assemble
+
+#define N 256
+#define LOG_N 8
+#define FIELDS 6
+#define TWO_PI 6.28318530718
+#define G 9.81
+
+RWTexture2D<float4> _H0;                  // xy h0(k), zw conj(h0(-k))
+RWTexture2DArray<float2> _Spectrum;       // FIELDS packed complex fields
+RWTexture2D<float4> _Displacement;        // x, y, z displacement
+RWTexture2D<float4> _Derivatives;         // d(eta)/dx, d(eta)/dz, dDx/dx, dDz/dz
+RWTexture2D<float2> _Foam;                // persistent foam, Jacobian
+RWTexture2D<float4> _Velocity;            // surface velocity
+
+float _PatchSize;
+float _KMin;                              // this cascade's band of wavenumbers
+float _KMax;
+float _WaveTime;
+float _DeltaTime;
+float _Choppiness;
+float _Alpha;                             // JONSWAP
+float _PeakOmega;
+float _Gamma;
+float2 _WindDirection;
+float _Spreading;                         // cos^(2s) exponent s
+float _HeightScale;
+uint _Seed;
+float _FoamBias;
+float _FoamGain;
+float _FoamDecay;
+
+uint Hash(uint s)
+{
+    s ^= 2747636419u;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    s ^= s >> 16;
+    s *= 2654435769u;
+    return s;
+}
+
+float2 Gaussian(uint2 index)
+{
+    uint h = Hash(index.x + index.y * N + _Seed * 65537u);
+    float u1 = max((Hash(h) & 0xffffff) / 16777216.0, 1e-7);
+    float u2 = (Hash(h ^ 0x9e3779b9u) & 0xffffff) / 16777216.0;
+    float r = sqrt(-2.0 * log(u1));
+    return r * float2(cos(TWO_PI * u2), sin(TWO_PI * u2));
+}
+
+// Stirling's series for ln(Gamma(x)); accurate to about 1e-6 for x >= 1, all it is used for.
+float lgammaApprox(float x)
+{
+    float inv = 1.0 / x;
+    return (x - 0.5) * log(x) - x + 0.91893853 + inv / 12.0 - inv * inv * inv / 360.0;
+}
+
+float2 WaveVector(uint2 index)
+{
+    return TWO_PI / _PatchSize * (float2(index) - N / 2);
+}
+
+// Directional wave spectrum per unit area of k-space (m^4), within this cascade's band.
+float Spectrum(float2 k)
+{
+    float kLength = length(k);
+    if (kLength < _KMin || kLength >= _KMax || kLength < 1e-6)
+        return 0;
+    float omega = sqrt(G * kLength);
+    float sigma = omega <= _PeakOmega ? 0.07 : 0.09;
+    float r = exp(-(omega - _PeakOmega) * (omega - _PeakOmega) / (2.0 * sigma * sigma * _PeakOmega * _PeakOmega));
+    float ratio = _PeakOmega / omega;
+    float jonswap = _Alpha * G * G / pow(omega, 5.0) * exp(-1.25 * ratio * ratio * ratio * ratio) * pow(_Gamma, r);
+
+    // cos^(2s) of half the angle to the wind, normalized; s falls off away from the peak, so
+    // short waves spread wider than the swell, as in a real wind sea.
+    float cosTheta = dot(k / kLength, _WindDirection);
+    float s = _Spreading * pow(saturate(omega / _PeakOmega), omega > _PeakOmega ? -2.5 : 5.0) + 1.0;
+    float halfAngleCos = sqrt(saturate(0.5 + 0.5 * cosTheta));
+    float norm = exp(lgammaApprox(s + 1.0) * 2.0 - lgammaApprox(2.0 * s + 1.0)) * pow(2.0, 2.0 * s - 1.0) / 3.14159265;
+    float spreading = norm * pow(max(halfAngleCos, 1e-6), 2.0 * s);
+
+    // S(omega, theta) to S(kx, kz): d(omega)/dk / k, with deep-water dispersion.
+    float dOmegaDk = G / (2.0 * omega);
+    // Damps waves shorter than a few texels, which would only alias.
+    float texel = _PatchSize / N;
+    float damping = exp(-kLength * kLength * texel * texel * 0.5);
+    return jonswap * spreading * dOmegaDk / kLength * damping;
+}
+
+[numthreads(8, 8, 1)]
+void InitSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    float dk = TWO_PI / _PatchSize;
+    // Mean squared amplitude per mode is S dk^2 / 2, and a complex Gaussian has E|g|^2 = 2.
+    float2 k = WaveVector(id.xy);
+    float2 h0 = Gaussian(id.xy) * (0.5 * dk * sqrt(Spectrum(k))) * _HeightScale;
+    uint2 mirror = (N - id.xy) % N;
+    float2 h0Minus = Gaussian(mirror) * (0.5 * dk * sqrt(Spectrum(-k))) * _HeightScale;
+    // The Nyquist row and column have no mirror partner; leave them out.
+    if (id.x == 0 || id.y == 0)
+        h0 = h0Minus = 0;
+    _H0[id.xy] = float4(h0, h0Minus.x, -h0Minus.y);
+}
+
+float2 ComplexMul(float2 a, float2 b) { return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+float2 MulI(float2 a) { return float2(-a.y, a.x); }
+// a + i b, for two complex spectra of real fields.
+float2 Pack(float2 a, float2 b) { return float2(a.x - b.y, a.y + b.x); }
+
+[numthreads(8, 8, 1)]
+void TimeSpectrum(uint3 id : SV_DispatchThreadID)
+{
+    float2 k = WaveVector(id.xy);
+    float kLength = length(k);
+    float4 h0 = _H0[id.xy];
+    float omega = sqrt(G * kLength);
+    float2 phase = float2(cos(omega * _WaveTime), sin(omega * _WaveTime));
+    float2 forward = ComplexMul(h0.xy, phase);
+    float2 backward = ComplexMul(h0.zw, float2(phase.x, -phase.y));
+    float2 h = forward + backward;
+    float2 ht = MulI(forward - backward) * omega;
+
+    float2 unit = kLength > 1e-6 ? k / kLength : 0;
+    float invK = kLength > 1e-6 ? 1.0 / kLength : 0;
+    float2 dx = -MulI(h) * unit.x * _Choppiness;
+    float2 dz = -MulI(h) * unit.y * _Choppiness;
+    float2 slopeX = MulI(h) * k.x;
+    float2 slopeZ = MulI(h) * k.y;
+    float2 dxdx = h * (k.x * k.x * invK * _Choppiness);
+    float2 dzdz = h * (k.y * k.y * invK * _Choppiness);
+    float2 dxdz = h * (k.x * k.y * invK * _Choppiness);
+    float2 vx = -MulI(ht) * unit.x * _Choppiness;
+    float2 vz = -MulI(ht) * unit.y * _Choppiness;
+
+    _Spectrum[uint3(id.xy, 0)] = Pack(h, dx);
+    _Spectrum[uint3(id.xy, 1)] = Pack(dz, slopeX);
+    _Spectrum[uint3(id.xy, 2)] = Pack(slopeZ, dxdx);
+    _Spectrum[uint3(id.xy, 3)] = Pack(dzdz, dxdz);
+    _Spectrum[uint3(id.xy, 4)] = Pack(ht, vx);
+    _Spectrum[uint3(id.xy, 5)] = vz;
+}
+
+groupshared float2 buffer[2][N];
+
+// Inverse radix-2 FFT of one line held in groupshared memory, input in bit-reversed order.
+// Returns which half of the buffer holds the result.
+uint InverseFFT(uint t)
+{
+    uint src = 0;
+    [unroll]
+    for (uint stage = 0; stage < LOG_N; stage++)
+    {
+        uint span = 1u << stage;
+        uint j = t & (span - 1u);
+        bool top = (t & span) == 0;
+        uint even = top ? t : t - span;
+        float angle = TWO_PI * j / (2.0 * span);
+        float2 w = float2(cos(angle), sin(angle));
+        float2 odd = ComplexMul(w, buffer[src][even + span]);
+        buffer[1u - src][t] = top ? buffer[src][even] + odd : buffer[src][even] - odd;
+        src = 1u - src;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    return src;
+}
+
+// One group per line and field: dispatch (N, FIELDS, 1).
+[numthreads(N, 1, 1)]
+void FFTRows(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
+{
+    uint3 texel = uint3(t, group.x, group.y);
+    buffer[0][reversebits(t) >> (32 - LOG_N)] = _Spectrum[texel];
+    GroupMemoryBarrierWithGroupSync();
+    _Spectrum[texel] = buffer[InverseFFT(t)][t];
+}
+
+[numthreads(N, 1, 1)]
+void FFTColumns(uint3 group : SV_GroupID, uint t : SV_GroupIndex)
+{
+    uint3 texel = uint3(group.x, t, group.y);
+    buffer[0][reversebits(t) >> (32 - LOG_N)] = _Spectrum[texel];
+    GroupMemoryBarrierWithGroupSync();
+    _Spectrum[texel] = buffer[InverseFFT(t)][t];
+}
+
+[numthreads(8, 8, 1)]
+void Assemble(uint3 id : SV_DispatchThreadID)
+{
+    // The spectrum is stored centered (k index n - N/2), which flips the sign of every other texel.
+    float sign = ((id.x + id.y) & 1u) ? -1.0 : 1.0;
+    float2 f0 = _Spectrum[uint3(id.xy, 0)] * sign;
+    float2 f1 = _Spectrum[uint3(id.xy, 1)] * sign;
+    float2 f2 = _Spectrum[uint3(id.xy, 2)] * sign;
+    float2 f3 = _Spectrum[uint3(id.xy, 3)] * sign;
+    float2 f4 = _Spectrum[uint3(id.xy, 4)] * sign;
+    float2 f5 = _Spectrum[uint3(id.xy, 5)] * sign;
+
+    _Displacement[id.xy] = float4(f0.y, f0.x, f1.x, 0);
+    _Derivatives[id.xy] = float4(f1.y, f2.x, f2.y, f3.x);
+    _Velocity[id.xy] = float4(f4.y, f4.x, f5.x, 0);
+
+    // Where the surface folds over itself (Jacobian of the horizontal displacement near or
+    // below zero) the crest is breaking: foam builds there and fades slowly behind it.
+    float jacobian = (1.0 + f2.y) * (1.0 + f3.x) - f3.y * f3.y;
+    float previous = _Foam[id.xy].x * exp(-_FoamDecay * _DeltaTime);
+    float fresh = saturate((_FoamBias - jacobian) * _FoamGain);
+    _Foam[id.xy] = float2(max(previous, fresh), jacobian);
+}

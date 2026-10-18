@@ -22,6 +22,7 @@ float _Poly6Coeff;
 float _SpikyGradCoeff;
 float _ConstraintRelaxation;
 float _Cohesion;
+float _RestSpacing;
 float _SCorrK;
 float _SCorrInvWdq;
 float _Viscosity;

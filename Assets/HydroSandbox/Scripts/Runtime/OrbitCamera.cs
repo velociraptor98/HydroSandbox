@@ -6,6 +6,8 @@ namespace HydroSandbox
     /// <summary>
     /// Orbit / pan / zoom camera for inspecting a simulation: left drag orbits, right or middle
     /// drag pans, the scroll wheel zooms. Ignores the mouse while an IMGUI control is in use.
+    /// While something else owns the left button (<see cref="LeftButtonFree"/> false), right drag
+    /// orbits and middle drag pans.
     /// </summary>
     public class OrbitCamera : MonoBehaviour
     {
@@ -17,24 +19,29 @@ namespace HydroSandbox
         [SerializeField, Min(0.01f)] float zoomSpeed = 0.1f;
         [SerializeField] Vector2 distanceRange = new Vector2(0.5f, 40f);
 
+        public bool LeftButtonFree { get; set; } = true;
+        public bool ScrollFree { get; set; } = true;
+
         void LateUpdate()
         {
             Mouse mouse = Mouse.current;
             if (mouse != null && GUIUtility.hotControl == 0)
             {
                 Vector2 delta = mouse.delta.ReadValue();
-                if (mouse.leftButton.isPressed)
+                bool orbit = LeftButtonFree ? mouse.leftButton.isPressed : mouse.rightButton.isPressed;
+                bool pan = mouse.middleButton.isPressed || (LeftButtonFree && mouse.rightButton.isPressed);
+                if (orbit)
                 {
                     yaw += delta.x * orbitSpeed;
                     pitch = Mathf.Clamp(pitch - delta.y * orbitSpeed, -89f, 89f);
                 }
-                else if (mouse.rightButton.isPressed || mouse.middleButton.isPressed)
+                else if (pan)
                 {
                     float panScale = distance * 0.0015f;
                     target -= (transform.right * delta.x + transform.up * delta.y) * panScale;
                 }
                 float scroll = mouse.scroll.ReadValue().y;
-                if (Mathf.Abs(scroll) > 0.01f)
+                if (ScrollFree && Mathf.Abs(scroll) > 0.01f)
                     distance = Mathf.Clamp(distance * (1f - Mathf.Sign(scroll) * zoomSpeed), distanceRange.x, distanceRange.y);
             }
 

@@ -57,6 +57,8 @@ void ComputeDeltaPosition(uint3 id : SV_DispatchThreadID)
     float3 pi = _Predicted[i].xyz;
     float lambdaI = _Lambda[i];
     float3 delta = 0;
+    float3 separation = 0;
+    float minDistance = 0.9 * _RestSpacing;
 
     FOR_EACH_NEIGHBOR(i, j)
         float3 r = pi - _Predicted[j].xyz;
@@ -67,10 +69,19 @@ void ComputeDeltaPosition(uint3 id : SV_DispatchThreadID)
         float ratio = Poly6(r2) * _SCorrInvWdq;
         ratio *= ratio;
         float sCorr = -_SCorrK * ratio * ratio;
-        delta += (lambdaI + _Lambda[j] + sCorr) * SpikyGradient(r, r2, i, j);
+        float lambdaPair = lambdaI + _Lambda[j];
+        delta += (lambdaPair + sCorr) * SpikyGradient(r, r2, i, j);
+        // A positive pair lambda is cohesion pulling under-dense particles toward rest density,
+        // which surface particles can never reach: with nothing else resisting, it packs thin
+        // streams and puddles into tight clumps (neighbors at 0.75 of rest spacing). A minimum
+        // distance for those pairs stops that. Compressed pairs are left to the density solve,
+        // or it fights the walls.
+        float len = sqrt(r2);
+        if (lambdaPair > 0.0 && len < minDistance && len > 1e-6)
+            separation += (minDistance - len) * 0.5 * (r / len);
     END_FOR_EACH_NEIGHBOR
 
-    _DeltaPosition[i] = float4(delta * (_ParticleMass * _InvRestDensity), 0);
+    _DeltaPosition[i] = float4(delta * (_ParticleMass * _InvRestDensity) + separation, 0);
 }
 
 [numthreads(THREAD_GROUP_SIZE, 1, 1)]

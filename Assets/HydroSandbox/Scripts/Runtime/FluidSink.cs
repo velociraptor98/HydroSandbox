@@ -30,6 +30,12 @@ namespace HydroSandbox
 
         float budgetCarry;
 
+        public float DrainRate
+        {
+            get => drainRate;
+            set => drainRate = Mathf.Max(0f, value);
+        }
+
         void OnEnable() => Active.Add(this);
 
         void OnDisable() => Active.Remove(this);

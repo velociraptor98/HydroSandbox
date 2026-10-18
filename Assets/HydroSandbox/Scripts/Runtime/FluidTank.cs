@@ -83,12 +83,36 @@ namespace HydroSandbox
             return true;
         }
 
-        public void SealAll()
+        /// <summary>The hole nearest <paramref name="point"/> on the wall <paramref name="normal"/> picks, within <paramref name="margin"/> of its rim; -1 if none.</summary>
+        public int FindHole(Vector3 point, Vector3 normal, float margin)
         {
-            holes.Clear();
-            foreach (GameObject edge in holeEdges)
-                DestroyEdge(edge);
-            holeEdges.Clear();
+            if (!TryPlaceHole(point, normal, 0f, out TankHole probe))
+                return -1;
+            int best = -1;
+            float bestDistance = float.MaxValue;
+            for (int i = 0; i < holes.Count; i++)
+            {
+                if (holes[i].wall != probe.wall)
+                    continue;
+                float distance = Vector3.Distance(holes[i].center, probe.center) - holes[i].radius;
+                if (distance < margin && distance < bestDistance)
+                {
+                    best = i;
+                    bestDistance = distance;
+                }
+            }
+            return best;
+        }
+
+        public Vector3 HoleCenter(int index) => holes[index].center;
+        public float HoleRadius(int index) => holes[index].radius;
+        public Vector3 HoleAxis(int index) => WallAxis(holes[index].wall);
+
+        public void Seal(int index)
+        {
+            holes.RemoveAt(index);
+            DestroyEdge(holeEdges[index]);
+            holeEdges.RemoveAt(index);
             holesDirty = true;
         }
 

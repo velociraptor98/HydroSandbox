@@ -1,0 +1,66 @@
+// Drives the particle water at the edge of an ocean zone (FluidOceanBoundary). In a band along
+// the zone's side walls, particle velocities relax toward the FFT ocean's orbital velocity, so
+// the band moves with the open sea outside and sends its waves into the zone, where they shoal
+// and break freely. Runs before the prediction step of every substep.
+//
+// The FFT sea is deep water, but the band lies over a shelf a few meters deep. There a wave of
+// the same height needs a larger horizontal flow, uniform over the depth (long waves in
+// shallow water), so the swell cascade's horizontal velocity is scaled up by _ShallowGain and
+// not faded with depth; only the vertical motion fades.
+
+#pragma kernel ForceTowardOcean
+
+#include "FluidCommon.hlsl"
+#include "OceanCommon.hlsl"
+
+RWStructuredBuffer<float4> _Velocities;
+StructuredBuffer<float4> _Positions;
+Texture2D<float4> _OceanVelocity0;
+Texture2D<float4> _OceanVelocity1;
+
+float _SeaLevel;
+float _ParticleRadius;
+float _RelaxationRate;      // 1/s at the outer wall
+float _PeakWavenumber;      // vertical motion fades as exp(k z) below the surface
+float _ShallowGain;         // sqrt(g / depth) / omega at the spectral peak
+float _Ramp;                // 0..1, eases the forcing in at the start
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ForceTowardOcean(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+    float4 p = _Positions[i];
+    if (!IsAlive(p))
+        return;
+    float band = _OceanZoneParams.x;
+    float inside = OceanZoneDistance(p.xz);
+    if (inside >= band)
+        return;
+
+    // Inside the zone the sheltered amplitude applies, as the heightfield shows it outside.
+    float shelter = _OceanZoneShelter.x;
+    float2 rest = OceanRestPosition(p.xz, shelter);
+    float2 uv0 = rest * _OceanCascadeSizes.z;
+    float2 uv1 = rest * _OceanCascadeSizes.w;
+    float2 tsunamiSlope;
+    float tsunami = TsunamiHeight(p.xz, tsunamiSlope);
+    float surface = _SeaLevel + OceanDisplacement(rest, 0, 0).y * shelter + tsunami;
+    // Spray thrown well clear of the sea is left alone. Water a little above the surface is
+    // not: a crest lifts it, and if the trough that follows did not pull it back down, the band
+    // would ratchet up above the sea around it.
+    if (p.y > surface + 1.5)
+        return;
+    float3 swell = _OceanVelocity0.SampleLevel(sampler_ocean_trilinear_repeat, uv0, 0).xyz;
+    float3 chop = _OceanVelocity1.SampleLevel(sampler_ocean_trilinear_repeat, uv1, 0).xyz;
+    float fade = exp(_PeakWavenumber * min(p.y - surface, 0.0));
+    float3 target = (float3(swell.x * _ShallowGain, swell.y * fade, swell.z * _ShallowGain) + chop * fade) * shelter
+                  + TsunamiFlow(tsunami);
+
+    float w = saturate(1.0 - inside / band);
+    w = w * w * (3.0 - 2.0 * w);
+    float blend = (1.0 - exp(-_RelaxationRate * w * _DeltaTime)) * _Ramp;
+    float4 v = _Velocities[i];
+    _Velocities[i] = float4(v.xyz + (target - v.xyz) * blend, v.w);
+}

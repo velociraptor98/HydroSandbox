@@ -1,0 +1,52 @@
+// Bins the particles inside a tank into a coarse grid of cells, summing each cell's particle
+// count and liquid fractions. The CPU reads the cells back for volumes and mixing indices
+// (MixingMonitor). The cell past the grid collects every live particle outside the tank.
+
+#pragma kernel ClearCells
+#pragma kernel AccumulateCells
+
+#include "FluidCommon.hlsl"
+
+#define FIXED_ONE 1024.0
+
+StructuredBuffer<float4> _Positions;
+StructuredBuffer<float4> _Composition;
+// Per cell: particle count, then each liquid's fraction summed in FIXED_ONE units.
+RWStructuredBuffer<uint> _Cells;
+
+float3 _MeterMin;
+float3 _MeterMax;
+uint3 _MeterResolution;
+uint _MeterCellCount;   // including the outside cell
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ClearCells(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _MeterCellCount * 5)
+        _Cells[id.x] = 0;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void AccumulateCells(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _ParticleCount)
+        return;
+    float4 p = _Positions[i];
+    if (!IsAlive(p))
+        return;
+
+    uint cell = _MeterCellCount - 1;
+    if (all(p.xyz >= _MeterMin) && all(p.xyz < _MeterMax))
+    {
+        uint3 c = min((uint3)((p.xyz - _MeterMin) / (_MeterMax - _MeterMin) * _MeterResolution), _MeterResolution - 1);
+        cell = (c.z * _MeterResolution.y + c.y) * _MeterResolution.x + c.x;
+    }
+    uint4 fractions = (uint4)round(saturate(_Composition[i]) * FIXED_ONE);
+    uint base = cell * 5;
+    InterlockedAdd(_Cells[base], 1);
+    InterlockedAdd(_Cells[base + 1], fractions.x);
+    InterlockedAdd(_Cells[base + 2], fractions.y);
+    InterlockedAdd(_Cells[base + 3], fractions.z);
+    InterlockedAdd(_Cells[base + 4], fractions.w);
+}

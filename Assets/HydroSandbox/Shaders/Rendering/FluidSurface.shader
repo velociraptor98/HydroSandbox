@@ -21,6 +21,8 @@ Shader "HydroSandbox/FluidSurface"
         #pragma target 4.5
         #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
         #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+        #include "Assets/HydroSandbox/Shaders/Compute/OceanCommon.hlsl"
+        #include "Assets/HydroSandbox/Shaders/Rendering/OceanFoam.hlsl"
 
         #define NO_FLUID_DEPTH 1e6
 
@@ -59,6 +61,17 @@ Shader "HydroSandbox/FluidSurface"
         {
             float deviceDepth = (rcp(eyeDepth) - _ZBufferParams.w) / _ZBufferParams.z;
             return ComputeWorldSpacePosition(uv, deviceDepth, UNITY_MATRIX_I_VP);
+        }
+
+        TEXTURE2D(_OceanDerivatives1);
+
+        // In an ocean zone (FluidOceanBoundary) particle water fades out toward the zone's edge,
+        // so the block's side walls never show against the heightfield sea outside.
+        float OceanZoneFade(float3 positionWS, float width)
+        {
+            if (_OceanZoneParams.z <= 0.0)
+                return 1.0;
+            return smoothstep(0.0, width, OceanZoneDistance(positionWS.xz));
         }
 
         // Scene ambient probe evaluated on the CPU: SampleSH reads per-object probe data, which a
@@ -239,7 +252,10 @@ Shader "HydroSandbox/FluidSurface"
                 float slopePrev = dPrev < NO_FLUID_DEPTH ? (center - dPrev) / stride : 1e6;
                 float slopeNext = dNext < NO_FLUID_DEPTH ? (dNext - center) / stride : 1e6;
                 float slope = abs(slopePrev) < abs(slopeNext) ? slopePrev : slopeNext;
-                slope = abs(slope * stride) < 4.0 * _BlurDepthFalloff ? slope : 0.0;
+                // A steep slope is still a plane, not a silhouette, if both sides agree: seen at
+                // grazing angles from far off, flat water changes depth by meters across the radius.
+                bool planar = abs(slopePrev - slopeNext) * stride < 2.0 * _BlurDepthFalloff;
+                slope = planar || abs(slope * stride) < 4.0 * _BlurDepthFalloff ? slope : 0.0;
 
                 float sum = center;
                 float weightSum = 1.0;
@@ -276,6 +292,7 @@ Shader "HydroSandbox/FluidSurface"
             HLSLPROGRAM
             #pragma vertex FullscreenVert
             #pragma fragment Frag
+            #pragma multi_compile_fog
 
             TEXTURE2D(_RippleNormal);
 
@@ -371,8 +388,13 @@ Shader "HydroSandbox/FluidSurface"
                 float eyeDepth = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r;
                 // Thin water lying on the bed is nearly coplanar with it; a strict depth test flips
                 // pixel to pixel there into a moire, so water up to a particle radius behind the
-                // scene still shows.
-                if (eyeDepth >= NO_FLUID_DEPTH || eyeDepth > SceneEyeDepth(uv) + _ParticleRadius)
+                // scene still shows. Near an ocean zone's edge that would let particle caps poke
+                // through the heightfield where its crests overlap the fading water, so the margin
+                // shrinks there.
+                if (eyeDepth >= NO_FLUID_DEPTH)
+                    discard;
+                float margin = _ParticleRadius * lerp(0.25, 1.0, OceanZoneFade(WorldPositionFromEyeDepth(uv, eyeDepth), _OceanZoneParams.w));
+                if (eyeDepth > SceneEyeDepth(uv) + margin)
                     discard;
 
                 float2 thicknessSpeed = SAMPLE_TEXTURE2D_LOD(_FluidThickness, sampler_LinearClamp, uv, 0).rg;
@@ -385,6 +407,18 @@ Shader "HydroSandbox/FluidSurface"
                 float3 positionWS = WorldPositionFromEyeDepth(uv, eyeDepth);
                 float3 geometricNormal = ReconstructNormal(uv, positionWS, eyeDepth);
                 float3 n = ApplyRipples(geometricNormal, positionWS, _RippleStrength * (1.0 + 2.0 * flow));
+                // In an ocean zone the particles are too coarse to carry the sea's short chop, so
+                // they borrow its slopes from the FFT ocean's small cascade (and its foam, below),
+                // sampled where the heightfield samples them: without them the water is a smooth
+                // dark mirror next to the faceted, streaked sea around it.
+                bool atSea = _OceanZoneParams.z > 0.0;
+                float2 oceanRest = atSea ? OceanRestPosition(positionWS.xz, _OceanZoneShelter.x) : 0;
+                if (atSea)
+                {
+                    float4 d = SAMPLE_TEXTURE2D(_OceanDerivatives1, sampler_TrilinearRepeat, oceanRest * _OceanCascadeSizes.w);
+                    float2 slope = float2(d.x / (1.0 + d.z), d.y / (1.0 + d.w));
+                    n = normalize(n + float3(-slope.x, 0.0, -slope.y) * saturate(geometricNormal.y));
+                }
                 float3 v = normalize(GetWorldSpaceViewDir(positionWS));
                 float nDotV = saturate(dot(n, v));
 
@@ -401,6 +435,10 @@ Shader "HydroSandbox/FluidSurface"
                 transmitted = lerp(transmitted, ambient, flow * _FlowSheen);
 
                 float3 r = reflect(-v, n);
+                // At sea the sky probe is a pure sky with nothing below the horizon; rays reflected
+                // down by the chop would see black, so they are folded up as the ocean shader does.
+                if (_OceanZoneParams.z > 0.0)
+                    r.y = abs(r.y);
                 float mip = PerceptualRoughnessToMipmapLevel(1.0 - _Smoothness);
                 float4 encodedEnv = SAMPLE_TEXTURECUBE_LOD(_GlossyEnvironmentCubeMap, sampler_GlossyEnvironmentCubeMap, r, mip);
                 float3 reflection = DecodeHDREnvironment(encodedEnv, _GlossyEnvironmentCubeMap_HDR);
@@ -416,8 +454,14 @@ Shader "HydroSandbox/FluidSurface"
                 float denom = nDotH * nDotH * (a2 - 1.0) + 1.0;
                 float ggx = a2 / (PI * denom * denom);
                 color += mainLight.color * ggx * fresnel * saturate(dot(n, mainLight.direction));
+                if (atSea)
+                {
+                    float foam = OceanFoamCoverage(oceanRest, TEXTURE2D_ARGS(_OceanFoamPattern, sampler_TrilinearRepeat), _OceanFoamPatternScale);
+                    color = lerp(color, OceanFoamLit(_OceanFoamColor.rgb, ambient, n, mainLight), foam * saturate(geometricNormal.y));
+                }
 
-                float alpha = saturate(thickness * _EdgeOpacity);
+                color = MixFog(color, ComputeFogFactor(TransformWorldToHClip(positionWS).z));
+                float alpha = saturate(thickness * _EdgeOpacity) * OceanZoneFade(positionWS, _OceanZoneParams.w);
                 return float4(color, alpha);
             }
             ENDHLSL
@@ -543,6 +587,7 @@ Shader "HydroSandbox/FluidSurface"
             HLSLPROGRAM
             #pragma vertex FullscreenVert
             #pragma fragment Frag
+            #pragma multi_compile_fog
 
             TEXTURE2D(_Whitewater);
             float4 _FoamTint;
@@ -564,7 +609,19 @@ Shader "HydroSandbox/FluidSurface"
                 float3 lit = _FoamTint.rgb * (SampleAmbient(float3(0, 1, 0)) * 1.6 + mainLight.color * 0.7);
                 float3 bubbleLit = lit * lerp(float3(1, 1, 1), _ScatterColor.rgb * 3.0, 0.4);
                 float3 color = (lit * visible + bubbleLit * submerged * (1.0 - visible)) / alpha;
-                return float4(color, alpha);
+                // Whitewater rides on the water, so it is fogged at the water's depth, or the
+                // scene's for spray thrown clear of it. Against the sky neither exists; spray is
+                // never far from the camera's subject, so its depth is capped at 2% of the far plane.
+                float fluidEye = SAMPLE_TEXTURE2D_LOD(_FluidDepth, sampler_PointClamp, uv, 0).r;
+                float eyeDepth = min(fluidEye, SceneEyeDepth(uv));
+                if (fluidEye >= NO_FLUID_DEPTH)
+                    eyeDepth = min(eyeDepth, _ProjectionParams.z * 0.02);
+                float3 positionWS = WorldPositionFromEyeDepth(uv, eyeDepth);
+                color = MixFog(color, ComputeFogFactor(TransformWorldToHClip(positionWS).z));
+                // Foam fades over the whole forcing band, wider than the water's own fade: the
+                // heightfield sea outside has far less of it, and a straight foam line gives the
+                // zone away.
+                return float4(color, alpha * OceanZoneFade(positionWS, _OceanZoneParams.x));
             }
             ENDHLSL
         }

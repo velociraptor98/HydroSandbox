@@ -5,20 +5,23 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
-  - enabled: 1
+  - enabled: 0
     path: Assets/Scenes/SampleScene.unity
     guid: 99c9720ab356a0642a771bea13969a05
-  - enabled: 1
+  - enabled: 0
     path: Assets/HydroSandbox/Scenes/BoxContainer.unity
     guid: fc98816d75e8948d6b6d00ff4be320bd
-  - enabled: 1
+  - enabled: 0
     path: Assets/HydroSandbox/Scenes/WallFountain.unity
     guid: 314d8e2f60d6142478a42ff1de9545bc
-  - enabled: 1
+  - enabled: 0
     path: Assets/HydroSandbox/Scenes/MountainStream.unity
     guid: 77ffba1a0257d4a0bbba962196fe3dbc
   - enabled: 1
     path: Assets/HydroSandbox/Scenes/MixingTank.unity
     guid: 819cedb3afceb4a91882d79683392164
+  - enabled: 1
+    path: Assets/HydroSandbox/Scenes/StormLighthouse.unity
+    guid: 9cbf695c001f0426a8d8577d5d0345f6
   m_configObjects:
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}

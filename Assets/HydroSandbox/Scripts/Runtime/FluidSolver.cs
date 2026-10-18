@@ -66,6 +66,7 @@ namespace HydroSandbox
         readonly List<GraphicsBuffer> scanBlockOffsets = new List<GraphicsBuffer>();
 
         FluidRigidbodyCoupling coupling;
+        FluidOceanBoundary oceanBoundary;
         FluidMixing mixing;
         int poolSize;
         int hashTableSize;
@@ -195,13 +196,18 @@ namespace HydroSandbox
             int substeps = Mathf.Max(1, settings.substeps);
             coupling = TryGetComponent(out FluidRigidbodyCoupling c) && c.isActiveAndEnabled ? c : null;
             mixing = TryGetComponent(out FluidMixing m) && m.isActiveAndEnabled ? m : null;
+            oceanBoundary = TryGetComponent(out FluidOceanBoundary o) && o.isActiveAndEnabled ? o : null;
             cmd.Clear();
             cmd.BeginSample(solveSampler);
             PushParameters(settings.timeStep / substeps);
             RecordEmission(settings.timeStep);
             RecordColliderSetup();
             for (int i = 0; i < substeps; i++)
+            {
+                cmd.SetComputeFloatParam(collisionShader, Ids.ColliderTimeOffset, settings.timeStep * (substeps - 1 - i) / substeps);
+                oceanBoundary?.Record(cmd, this, settings.timeStep / substeps);
                 RecordSubstep(i == substeps - 1);
+            }
             coupling?.Record(cmd, this);
             if (TryGetComponent(out FluidWhitewater whitewater) && whitewater.isActiveAndEnabled)
                 whitewater.Record(cmd, this, settings.timeStep, frameIndex);
@@ -472,6 +478,7 @@ namespace HydroSandbox
             cmd.SetComputeFloatParam(cs, Ids.SpikyGradCoeff, -45f / (Mathf.PI * Mathf.Pow(h, 6)));
             cmd.SetComputeFloatParam(cs, Ids.ConstraintRelaxation, settings.constraintRelaxation / h2);
             cmd.SetComputeFloatParam(cs, Ids.Cohesion, settings.cohesion);
+            cmd.SetComputeFloatParam(cs, Ids.RestSpacing, settings.ParticleSpacing);
             cmd.SetComputeFloatParam(cs, Ids.SCorrK, settings.artificialPressure * h2);
             cmd.SetComputeFloatParam(cs, Ids.SCorrInvWdq, 1f / wDeltaQ);
             cmd.SetComputeFloatParam(cs, Ids.Viscosity, settings.viscosity);
@@ -810,6 +817,7 @@ namespace HydroSandbox
             public static readonly int SpikyGradCoeff = Shader.PropertyToID("_SpikyGradCoeff");
             public static readonly int ConstraintRelaxation = Shader.PropertyToID("_ConstraintRelaxation");
             public static readonly int Cohesion = Shader.PropertyToID("_Cohesion");
+            public static readonly int RestSpacing = Shader.PropertyToID("_RestSpacing");
             public static readonly int SCorrK = Shader.PropertyToID("_SCorrK");
             public static readonly int SCorrInvWdq = Shader.PropertyToID("_SCorrInvWdq");
             public static readonly int Viscosity = Shader.PropertyToID("_Viscosity");
@@ -860,6 +868,7 @@ namespace HydroSandbox
             public static readonly int SpawnPattern = Shader.PropertyToID("_SpawnPattern");
             public static readonly int ColliderCount = Shader.PropertyToID("_ColliderCount");
             public static readonly int Colliders = Shader.PropertyToID("_Colliders");
+            public static readonly int ColliderTimeOffset = Shader.PropertyToID("_ColliderTimeOffset");
             public static readonly int ParticleRadius = Shader.PropertyToID("_ParticleRadius");
             public static readonly int TerrainHeights = Shader.PropertyToID("_TerrainHeights");
             public static readonly int TerrainOrigin = Shader.PropertyToID("_TerrainOrigin");

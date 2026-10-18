@@ -63,6 +63,13 @@ namespace HydroSandbox
             set => speed = Mathf.Max(0.01f, value);
         }
 
+        /// <summary>Resizes a Rectangle source at runtime.</summary>
+        public void SetRectangle(float width, float height)
+        {
+            size = Mathf.Max(0f, width);
+            rectangleHeight = Mathf.Max(0f, height);
+        }
+
         public float FlowRateLitersPerSecond(float spacing)
         {
             int points = CountPattern(spacing);

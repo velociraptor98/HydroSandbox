@@ -37,6 +37,8 @@ namespace HydroSandbox
         [Tooltip("Lifetime range in seconds. Foam ages at full rate, spray and bubbles at 30%.")]
         [SerializeField] Vector2 lifetimeRange = new Vector2(1.5f, 4f);
         [SerializeField, Min(0f)] float sprayDrag = 0.5f;
+        [Tooltip("Air velocity spray is dragged toward (m/s).")]
+        [SerializeField] Vector3 wind = Vector3.zero;
         [Tooltip("Bubble rise acceleration, in multiples of gravity.")]
         [SerializeField, Min(0f)] float bubbleBuoyancy = 2f;
         [Tooltip("Per-frame pull of bubble velocity toward the surrounding water's velocity.")]
@@ -122,6 +124,7 @@ namespace HydroSandbox
             cmd.SetComputeFloatParam(cs, Ids.EmitSpread, emitSpread);
             cmd.SetComputeVectorParam(cs, Ids.LifetimeRange, lifetimeRange);
             cmd.SetComputeFloatParam(cs, Ids.SprayDrag, sprayDrag);
+            cmd.SetComputeVectorParam(cs, Ids.Wind, wind);
             cmd.SetComputeFloatParam(cs, Ids.BubbleBuoyancy, bubbleBuoyancy);
             cmd.SetComputeFloatParam(cs, Ids.BubbleDrag, bubbleDrag);
             cmd.SetComputeIntParam(cs, Ids.SprayMaxNeighbors, sprayMaxNeighbors);
@@ -189,6 +192,7 @@ namespace HydroSandbox
             public static readonly int EmitSpread = Shader.PropertyToID("_EmitSpread");
             public static readonly int LifetimeRange = Shader.PropertyToID("_LifetimeRange");
             public static readonly int SprayDrag = Shader.PropertyToID("_SprayDrag");
+            public static readonly int Wind = Shader.PropertyToID("_Wind");
             public static readonly int BubbleBuoyancy = Shader.PropertyToID("_BubbleBuoyancy");
             public static readonly int BubbleDrag = Shader.PropertyToID("_BubbleDrag");
             public static readonly int SprayMaxNeighbors = Shader.PropertyToID("_SprayMaxNeighbors");

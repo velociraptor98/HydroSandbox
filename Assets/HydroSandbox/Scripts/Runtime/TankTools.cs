@@ -4,102 +4,158 @@ using UnityEngine.InputSystem;
 namespace HydroSandbox
 {
     /// <summary>
-    /// Mouse tools for a <see cref="FluidTank"/> scene. Clicking a <see cref="PourNozzle"/> starts
-    /// or stops its pour. With the drill on (H, or the toolbar), clicking a side wall of the tank
-    /// drills a hole through the glass and the liquid leaks out. A click is a press and release
-    /// without dragging, so it does not fight the orbit camera.
+    /// The player's hand in a <see cref="FluidTank"/> scene. With nothing held, clicking a
+    /// <see cref="PourNozzle"/> starts or stops its pour and clicking a <see cref="BenchItem"/> picks
+    /// it up; dragging orbits the camera. A held item follows the cursor and gets the left button
+    /// (and the scroll wheel, if it wants it); right drag orbits instead, and a right click or
+    /// Escape puts the item back. A click is a press and release without dragging.
     /// </summary>
+    // Before FluidRigidbodyCoupling, so a held paddle's velocity is set before physics steps.
+    [DefaultExecutionOrder(-200)]
     public class TankTools : MonoBehaviour
     {
         const float ClickSlopPixels = 6f;
-        static readonly int BaseColor = Shader.PropertyToID("_BaseColor");
+        const int MaxHits = 16;
 
         [SerializeField] FluidTank tank;
+        [SerializeField] FluidSolver solver;
         [Tooltip("Names the liquids in the nozzle tooltips.")]
         [SerializeField] FluidMixing mixing;
         [Tooltip("Optional: clicks over its panel are ignored.")]
         [SerializeField] MixingPanel panel;
-        [SerializeField] bool drilling;
-        [SerializeField, Range(0.01f, 0.04f)] float holeRadius = 0.018f;
-        [SerializeField] Material previewMaterial;
 
+        readonly RaycastHit[] rawHits = new RaycastHit[MaxHits];
+        readonly RaycastHit[] hits = new RaycastHit[MaxHits];
         Camera view;
+        OrbitCamera orbit;
+        BenchItem held;
         PourNozzle hoveredNozzle;
-        bool pressValid;
-        Vector2 pressPosition;
-        bool hasDrillTarget;
-        Vector3 drillPoint, drillNormal;
-        GameObject preview;
-        float previewRadius;
-        Rect toolbarRect;
+        BenchItem hoveredItem;
+        readonly ClickTracker left = new ClickTracker();
+        readonly ClickTracker right = new ClickTracker();
 
-        public void Configure(FluidTank targetTank, FluidMixing liquids, MixingPanel mixingPanel, Material holePreview)
+        public void Configure(FluidTank targetTank, FluidSolver fluid, FluidMixing liquids, MixingPanel mixingPanel)
         {
             tank = targetTank;
+            solver = fluid;
             mixing = liquids;
             panel = mixingPanel;
-            previewMaterial = holePreview;
         }
 
         void OnDisable()
         {
             SetHovered(null);
-            if (preview != null)
-            {
-                Destroy(preview.GetComponent<MeshFilter>().sharedMesh);
-                Destroy(preview);
-            }
+            if (held != null)
+                held.PutBack();
+            held = null;
         }
 
         void Update()
         {
             Mouse mouse = Mouse.current;
-            Keyboard keyboard = Keyboard.current;
-            if (keyboard != null && keyboard.hKey.wasPressedThisFrame)
-                drilling = !drilling;
             if (view == null)
+            {
                 view = Camera.main;
+                orbit = view != null ? view.GetComponent<OrbitCamera>() : null;
+            }
             if (mouse == null || view == null)
                 return;
 
             Vector2 screen = mouse.position.ReadValue();
-            bool overUI = OverUI(screen);
+            bool overUI = panel != null && panel.ScreenRect.Contains(new Vector2(screen.x, Screen.height - screen.y));
+            bool free = !overUI && GUIUtility.hotControl == 0;
+            left.Update(mouse.leftButton, screen, free);
+            right.Update(mouse.rightButton, screen, free);
+
+            Ray ray = view.ScreenPointToRay(screen);
+            int hitCount = overUI ? 0 : CollectHits(ray);
+            hoveredItem = null;
             PourNozzle nozzle = null;
-            hasDrillTarget = false;
-            if (!overUI && Physics.Raycast(view.ScreenPointToRay(screen), out RaycastHit hit, 100f, ~0, QueryTriggerInteraction.Ignore))
+            if (hitCount > 0)
             {
-                nozzle = hit.collider.GetComponentInParent<PourNozzle>();
-                if (nozzle == null && drilling && tank != null && hit.collider.transform.IsChildOf(tank.transform))
-                {
-                    hasDrillTarget = tank.TryPlaceHole(hit.point, hit.normal, holeRadius, out _, out _);
-                    drillPoint = hit.point;
-                    drillNormal = hit.normal;
-                }
+                nozzle = hits[0].collider.GetComponentInParent<PourNozzle>();
+                if (held == null)
+                    hoveredItem = FirstItem(hitCount);
             }
             SetHovered(nozzle);
-            UpdatePreview();
 
-            if (mouse.leftButton.wasPressedThisFrame)
+            Keyboard keyboard = Keyboard.current;
+            if (held != null && (right.Clicked || (keyboard != null && keyboard.escapeKey.wasPressedThisFrame)))
             {
-                pressValid = !overUI && GUIUtility.hotControl == 0;
-                pressPosition = screen;
+                held.PutBack();
+                held = null;
             }
-            if ((screen - pressPosition).sqrMagnitude > ClickSlopPixels * ClickSlopPixels)
-                pressValid = false;
-            if (mouse.leftButton.wasReleasedThisFrame && pressValid)
+
+            var input = new HandInput
             {
-                pressValid = false;
-                if (nozzle != null)
-                    nozzle.Toggle();
-                else if (hasDrillTarget)
-                    tank.TryDrill(drillPoint, drillNormal, holeRadius);
+                ray = ray,
+                planePoint = PlanePoint(ray),
+                hits = hits,
+                hitCount = hitCount,
+                // A click on a nozzle pours whatever is in hand.
+                useHeld = free && nozzle == null && mouse.leftButton.isPressed,
+                useClicked = nozzle == null && left.Clicked,
+                scroll = free ? mouse.scroll.ReadValue().y : 0f,
+                physicsStep = solver != null && solver.GetComponent<FluidRigidbodyCoupling>() != null ? solver.Settings.timeStep : Time.fixedDeltaTime,
+                tank = tank,
+            };
+
+            if (nozzle != null && left.Clicked)
+                nozzle.Toggle();
+            else if (held == null && hoveredItem != null && left.Clicked)
+            {
+                held = hoveredItem;
+                hoveredItem = null;
+                // The click that picked it up must not also use it.
+                input.useClicked = false;
+                held.PickUp(input);
+            }
+            if (held != null && !held.Hold(input))
+                held = null;
+
+            if (orbit != null)
+            {
+                orbit.LeftButtonFree = held == null;
+                orbit.ScrollFree = held == null || !held.CapturesScroll;
             }
         }
 
-        bool OverUI(Vector2 screen)
+        int CollectHits(Ray ray)
         {
-            var gui = new Vector2(screen.x, Screen.height - screen.y);
-            return toolbarRect.Contains(gui) || (panel != null && panel.ScreenRect.Contains(gui));
+            int raw = Physics.RaycastNonAlloc(ray, rawHits, 100f, ~0, QueryTriggerInteraction.Collide);
+            int count = 0;
+            for (int i = 0; i < raw; i++)
+            {
+                if (held == null || !rawHits[i].collider.transform.IsChildOf(held.transform))
+                    hits[count++] = rawHits[i];
+            }
+            System.Array.Sort(hits, 0, count, HitDistanceComparer.Instance);
+            return count;
+        }
+
+        // An item may sit behind the glass, so look past the panes for it.
+        BenchItem FirstItem(int hitCount)
+        {
+            for (int i = 0; i < hitCount; i++)
+            {
+                Transform t = hits[i].collider.transform;
+                var item = t.GetComponentInParent<BenchItem>();
+                if (item != null)
+                    return item;
+                if (tank == null || !t.IsChildOf(tank.transform))
+                    return null;
+            }
+            return null;
+        }
+
+        Vector3 PlanePoint(Ray ray)
+        {
+            Vector3 center = tank != null ? tank.Interior.center : Vector3.zero;
+            Vector3 normal = Vector3.ProjectOnPlane(view.transform.forward, Vector3.up);
+            if (normal.sqrMagnitude < 1e-6f)
+                normal = Vector3.forward;
+            var plane = new Plane(normal.normalized, center);
+            return plane.Raycast(ray, out float enter) && enter > 0f ? ray.GetPoint(enter) : ray.GetPoint(2f);
         }
 
         void SetHovered(PourNozzle nozzle)
@@ -113,67 +169,61 @@ namespace HydroSandbox
                 nozzle.Hovered = true;
         }
 
-        void UpdatePreview()
-        {
-            if (!hasDrillTarget || previewMaterial == null)
-            {
-                if (preview != null)
-                    preview.SetActive(false);
-                return;
-            }
-            if (preview == null)
-            {
-                preview = new GameObject("Hole Preview");
-                preview.AddComponent<MeshFilter>();
-                var renderer = preview.AddComponent<MeshRenderer>();
-                renderer.sharedMaterial = previewMaterial;
-                renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-                var block = new MaterialPropertyBlock();
-                block.SetColor(BaseColor, new Color(1f, 0.55f, 0.15f, 0.8f));
-                renderer.SetPropertyBlock(block);
-            }
-            if (!Mathf.Approximately(previewRadius, holeRadius))
-            {
-                var filter = preview.GetComponent<MeshFilter>();
-                Destroy(filter.sharedMesh);
-                filter.sharedMesh = FluidTank.HoleEdgeMesh(holeRadius, tank.WallThickness * 1.2f, 0);
-                previewRadius = holeRadius;
-            }
-            tank.TryPlaceHole(drillPoint, drillNormal, holeRadius, out Vector3 center, out Vector3 axis);
-            preview.transform.SetPositionAndRotation(center, Quaternion.LookRotation(axis));
-            preview.SetActive(true);
-        }
-
         void OnGUI()
         {
-            if (tank == null)
+            if (Mouse.current == null)
                 return;
-            const float width = 560f, height = 58f;
-            toolbarRect = new Rect((Screen.width - width) * 0.5f, Screen.height - height - 10f, width, height);
-            GUILayout.BeginArea(toolbarRect, GUI.skin.box);
-            GUILayout.BeginHorizontal();
-            drilling = GUILayout.Toggle(drilling, drilling ? " Drill: on (H)" : " Drill: off (H)", GUILayout.Width(120));
-            GUILayout.Label($"Hole Ø {holeRadius * 200f:F1} cm", GUILayout.Width(90));
-            holeRadius = GUILayout.HorizontalSlider(holeRadius, 0.01f, 0.04f, GUILayout.Width(120));
-            GUILayout.FlexibleSpace();
-            GUI.enabled = tank.HoleCount > 0;
-            if (GUILayout.Button($"Seal holes ({tank.HoleCount})", GUILayout.Width(130)))
-                tank.SealAll();
-            GUI.enabled = true;
-            GUILayout.EndHorizontal();
-            GUILayout.Label(drilling
-                ? "Click a side of the tank to drill a hole. Click a nozzle to pour."
-                : "Click a nozzle to start or stop its pour. Drag to orbit, scroll to zoom.");
-            GUILayout.EndArea();
-
-            if (hoveredNozzle != null && hoveredNozzle.Source != null && Mouse.current != null)
+            string text = null;
+            if (hoveredNozzle != null && hoveredNozzle.Source != null)
             {
                 int liquid = hoveredNozzle.Source.Liquid;
                 string name = mixing != null && liquid < mixing.LiquidCount ? mixing.Liquids[liquid].name : "liquid";
-                Vector2 m = Mouse.current.position.ReadValue();
-                var label = new Rect(m.x + 16f, Screen.height - m.y + 8f, 160f, 24f);
-                GUI.Label(label, hoveredNozzle.Pouring ? $"Stop {name}" : $"Pour {name}", GUI.skin.box);
+                text = hoveredNozzle.Pouring ? $"Stop {name}" : $"Pour {name}";
             }
+            else if (held != null)
+                text = held.HeldHint;
+            else if (hoveredItem != null)
+                text = hoveredItem is DropObject drop
+                    ? $"{hoveredItem.DisplayName} · {drop.Density:N0} kg/m³\nClick to pick up"
+                    : $"Pick up {hoveredItem.DisplayName}";
+            if (string.IsNullOrEmpty(text))
+                return;
+
+            Vector2 m = Mouse.current.position.ReadValue();
+            var content = new GUIContent(text);
+            Vector2 size = GUI.skin.box.CalcSize(content);
+            GUI.Label(new Rect(m.x + 18f, Screen.height - m.y + 10f, size.x, size.y), content, GUI.skin.box);
+        }
+
+        sealed class ClickTracker
+        {
+            bool valid;
+            Vector2 pressPosition;
+
+            public bool Clicked { get; private set; }
+
+            public void Update(UnityEngine.InputSystem.Controls.ButtonControl button, Vector2 screen, bool free)
+            {
+                Clicked = false;
+                if (button.wasPressedThisFrame)
+                {
+                    valid = free;
+                    pressPosition = screen;
+                }
+                if ((screen - pressPosition).sqrMagnitude > ClickSlopPixels * ClickSlopPixels)
+                    valid = false;
+                if (button.wasReleasedThisFrame && valid)
+                {
+                    valid = false;
+                    Clicked = true;
+                }
+            }
+        }
+
+        sealed class HitDistanceComparer : System.Collections.Generic.IComparer<RaycastHit>
+        {
+            public static readonly HitDistanceComparer Instance = new HitDistanceComparer();
+            public int Compare(RaycastHit a, RaycastHit b) => a.distance.CompareTo(b.distance);
         }
     }
 }
